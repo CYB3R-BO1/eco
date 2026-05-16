@@ -19,8 +19,8 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from core.config.settings import get_settings
 from core.database.base import Base
 
-# Phase 2+: uncomment as models are added so they appear in target_metadata.
-# from storage.postgres.models import *  # noqa: F401, F403
+# Importing the model registry registers every ORM class with Base.metadata.
+from storage.postgres.models import *  # noqa: F401, F403, E402
 
 config = context.config
 if config.config_file_name is not None:

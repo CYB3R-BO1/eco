@@ -1,6 +1,21 @@
-# Domain ORM models live here from Phase 2 onward:
-# investigations, evidence, investigation_events, firewall_events,
-# audit_logs, entity_aliases, etc. (see PLAN.md §5).
-#
-# Every model imported in this file is picked up by Alembic autogenerate
-# via core.database.base.Base.metadata.
+"""ORM model registry.
+
+Importing every model here ensures ``Base.metadata`` is fully populated when
+Alembic's ``env.py`` does ``from storage.postgres.models import *``, which is
+how autogenerate sees new tables.
+"""
+from storage.postgres.models.entity_alias import EntityAlias
+from storage.postgres.models.enrichment_result import EnrichmentResultRow
+from storage.postgres.models.evidence import EvidenceRow
+from storage.postgres.models.idempotency_key import IdempotencyKeyRow
+from storage.postgres.models.investigation import Investigation
+from storage.postgres.models.investigation_event import InvestigationEvent
+
+__all__ = [
+    "EntityAlias",
+    "EnrichmentResultRow",
+    "EvidenceRow",
+    "IdempotencyKeyRow",
+    "Investigation",
+    "InvestigationEvent",
+]
