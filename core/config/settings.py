@@ -102,6 +102,39 @@ class LoggingSettings(BaseSettings):
     json: bool = True
 
 
+class FirewallSettings(BaseSettings):
+    """Knobs for the AI Firewall (Phase 4).
+
+    Defaults are deliberately conservative: block at ≥0.85, sanitize at
+    ≥0.65, review at ≥0.40, allow otherwise. ``detection_timeout_ms``
+    bounds the entire pipeline (including the LLM-classifier slot, which is
+    a stub in Phase 4 but kept inside the timeout for future-proofing).
+    ``finding_weight_floor`` controls which fired rules become Findings in
+    the graph — rules below the floor still fire and count toward the
+    score, they just don't materialize as Finding nodes.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="FIREWALL_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    enabled: bool = True
+    max_prompt_bytes: int = 32_000
+    max_output_bytes: int = 64_000
+    detection_timeout_ms: int = 2_000
+
+    block_threshold: float = 0.85
+    sanitize_threshold: float = 0.65
+    review_threshold: float = 0.40
+
+    finding_weight_floor: float = 0.50
+    pii_masking_enabled: bool = True
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -119,6 +152,7 @@ class Settings(BaseSettings):
     neo4j: Neo4jSettings = Field(default_factory=Neo4jSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    firewall: FirewallSettings = Field(default_factory=FirewallSettings)
 
 
 @lru_cache(maxsize=1)

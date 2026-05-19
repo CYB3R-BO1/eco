@@ -19,6 +19,8 @@ from core.config.settings import Settings, get_settings
 from core.database.postgres import Database
 from core.events.emitter import EventEmitter
 from evidence.store import EvidenceStore
+from firewall.service import FirewallService
+from graph.correlation.correlator import GraphCorrelator
 from graph.graph_service.service import GraphService
 from graph.neo4j.driver import Neo4jClient
 from investigation.background import BackgroundTaskRunner
@@ -46,6 +48,10 @@ def get_neo4j_client(request: Request) -> Neo4jClient:
 
 def get_graph_service(request: Request) -> GraphService:
     return request.app.state.graph_service  # type: ignore[no-any-return]
+
+
+def get_graph_correlator(request: Request) -> GraphCorrelator:
+    return request.app.state.graph_correlator  # type: ignore[no-any-return]
 
 
 def get_event_emitter(request: Request) -> EventEmitter:
@@ -76,6 +82,10 @@ def get_ingestion_pipeline(request: Request) -> IngestionPipeline:
     return request.app.state.ingestion_pipeline  # type: ignore[no-any-return]
 
 
+def get_firewall_service(request: Request) -> FirewallService:
+    return request.app.state.firewall_service  # type: ignore[no-any-return]
+
+
 async def get_db_session(
     db: Annotated[Database, Depends(get_database)],
 ) -> AsyncIterator[AsyncSession]:
@@ -89,6 +99,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_db_session)]
 RedisDep = Annotated[RedisClient, Depends(get_redis_client)]
 Neo4jDep = Annotated[Neo4jClient, Depends(get_neo4j_client)]
 GraphServiceDep = Annotated[GraphService, Depends(get_graph_service)]
+GraphCorrelatorDep = Annotated[GraphCorrelator, Depends(get_graph_correlator)]
 EventEmitterDep = Annotated[EventEmitter, Depends(get_event_emitter)]
 EvidenceStoreDep = Annotated[EvidenceStore, Depends(get_evidence_store)]
 EntityResolutionDep = Annotated[EntityResolutionService, Depends(get_resolver)]
@@ -96,3 +107,4 @@ EnrichmentExecutorDep = Annotated[EnrichmentExecutor, Depends(get_enrichment_exe
 LifecycleManagerDep = Annotated[LifecycleManager, Depends(get_lifecycle_manager)]
 BackgroundRunnerDep = Annotated[BackgroundTaskRunner, Depends(get_background_runner)]
 IngestionPipelineDep = Annotated[IngestionPipeline, Depends(get_ingestion_pipeline)]
+FirewallServiceDep = Annotated[FirewallService, Depends(get_firewall_service)]

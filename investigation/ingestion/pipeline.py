@@ -32,6 +32,8 @@ from core.events.types import EventType
 from evidence.models import Evidence, Provenance
 from evidence.provenance import ProvenanceLevel
 from evidence.store import EvidenceStore
+from graph.correlation.correlator import GraphCorrelator
+from graph.graph_service.service import GraphService
 from investigation.background import BackgroundTaskRunner
 from investigation.enrichment.executor import EnrichmentExecutor
 from investigation.extraction.extractor import ExtractedIOC, extract_iocs
@@ -80,6 +82,8 @@ class IngestionPipeline:
         enrichment_executor: EnrichmentExecutor,
         lifecycle_manager: LifecycleManager,
         background_runner: BackgroundTaskRunner,
+        graph_correlator: GraphCorrelator,
+        graph_service: GraphService,
     ) -> None:
         self._db = database
         self._evidence = evidence_store
@@ -88,6 +92,8 @@ class IngestionPipeline:
         self._enrichment = enrichment_executor
         self._lifecycle = lifecycle_manager
         self._runner = background_runner
+        self._correlator = graph_correlator
+        self._graph = graph_service
 
     async def ingest(
         self,
@@ -256,14 +262,49 @@ class IngestionPipeline:
                     chain_of_custody=[head_evidence_id, ev_id],
                 )
 
+            # --- Phase 3: CORRELATING phase ---------------------------
+            # Materialize the deterministic state as a Neo4j subgraph,
+            # then verify integrity. A clean report → COMPLETED; any
+            # finding → REVIEW_REQUIRED (per CLAUDE.md invariant #6).
             async with self._db.session() as session:
                 await self._lifecycle.transition(
                     session,
                     investigation_id,
-                    InvestigationState.COMPLETED,
-                    reason="enrichment finished",
+                    InvestigationState.CORRELATING,
+                    reason="graph correlation starting",
                 )
                 await session.commit()
+
+            await self._correlator.correlate(investigation_id)
+            report = await self._graph.integrity.check(investigation_id)
+
+            if report.has_violations:
+                async with self._db.session() as session:
+                    await self._events.emit(
+                        session,
+                        EventType.INTEGRITY_VIOLATION_DETECTED,
+                        source="graph_integrity",
+                        investigation_id=investigation_id,
+                        target=str(investigation_id),
+                        metadata=report.to_dict(),
+                        confidence=0.0,
+                    )
+                    await self._lifecycle.transition(
+                        session,
+                        investigation_id,
+                        InvestigationState.REVIEW_REQUIRED,
+                        reason="integrity violations detected",
+                    )
+                    await session.commit()
+            else:
+                async with self._db.session() as session:
+                    await self._lifecycle.transition(
+                        session,
+                        investigation_id,
+                        InvestigationState.COMPLETED,
+                        reason="correlation + integrity clean",
+                    )
+                    await session.commit()
         except Exception as e:
             log.exception(
                 "ingest.background_failed",

@@ -21,6 +21,13 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from evidence.validation import EvidenceValidationError
+from firewall.service import FirewallTimeoutError, PromptTooLargeError
+from graph.governance.validator import (
+    GraphSchemaViolationError,
+    TraversalLimitExceededError,
+)
+from graph.graph_service.mutations import GraphCardinalityError
+from graph.graph_service.traversal import NodeNotFoundError
 from investigation.extraction.extractor import TooLargeError, TooManyIocsError
 from investigation.ingestion.validation import IngestValidationError
 from investigation.lifecycle.manager import InvalidTransitionError
@@ -108,6 +115,90 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={"error": {"code": 422, "message": str(exc)}},
+        )
+
+    @app.exception_handler(GraphSchemaViolationError)
+    async def graph_schema_violation_handler(
+        request: Request, exc: GraphSchemaViolationError
+    ) -> JSONResponse:
+        log.warning(
+            "graph_schema_violation",
+            source=exc.source.value,
+            rel=exc.rel.value,
+            target=exc.target.value,
+            reason=exc.reason,
+            path=request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"error": {"code": 409, "message": str(exc)}},
+        )
+
+    @app.exception_handler(GraphCardinalityError)
+    async def graph_cardinality_handler(
+        request: Request, exc: GraphCardinalityError
+    ) -> JSONResponse:
+        log.warning(
+            "graph_cardinality_exceeded",
+            source_id=str(exc.source_id),
+            rel=exc.rel_type.value,
+            count=exc.count,
+            path=request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"error": {"code": 409, "message": str(exc)}},
+        )
+
+    @app.exception_handler(NodeNotFoundError)
+    async def node_not_found_handler(
+        request: Request, exc: NodeNotFoundError
+    ) -> JSONResponse:
+        log.warning("graph_node_not_found", node_id=str(exc.node_id), path=request.url.path)
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"error": {"code": 404, "message": str(exc)}},
+        )
+
+    @app.exception_handler(TraversalLimitExceededError)
+    async def traversal_limit_handler(
+        request: Request, exc: TraversalLimitExceededError
+    ) -> JSONResponse:
+        log.warning(
+            "traversal_limit_exceeded",
+            requested=exc.requested,
+            maximum=exc.maximum,
+            path=request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"error": {"code": 422, "message": str(exc)}},
+        )
+
+    @app.exception_handler(PromptTooLargeError)
+    async def prompt_too_large_handler(
+        request: Request, exc: PromptTooLargeError
+    ) -> JSONResponse:
+        log.warning(
+            "firewall.prompt_too_large",
+            kind=exc.kind,
+            length=exc.length,
+            limit=exc.limit,
+            path=request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            content={"error": {"code": 413, "message": str(exc)}},
+        )
+
+    @app.exception_handler(FirewallTimeoutError)
+    async def firewall_timeout_handler(
+        request: Request, exc: FirewallTimeoutError
+    ) -> JSONResponse:
+        log.warning("firewall.timeout", path=request.url.path)
+        return JSONResponse(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            content={"error": {"code": 504, "message": str(exc) or "firewall analysis timed out"}},
         )
 
     @app.exception_handler(Exception)

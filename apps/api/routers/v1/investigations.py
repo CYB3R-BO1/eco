@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
 
 from apps.api.dependencies import SessionDep
+from schemas.api.graph import TimelinePageResponse
 from schemas.api.investigation import InvestigationResponse, TimelineEntry
 from storage.postgres.models.evidence import EvidenceRow
 from storage.postgres.models.investigation import Investigation
@@ -70,4 +71,57 @@ async def get_investigation(
         updated_at=investigation.updated_at,
         evidence_refs=evidence_ids,
         timeline=timeline,
+    )
+
+
+@router.get(
+    "/{investigation_id}/timeline",
+    response_model=TimelinePageResponse,
+    summary="Paginated chronological replay of investigation events",
+)
+async def get_investigation_timeline(
+    investigation_id: uuid.UUID,
+    session: SessionDep,
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> TimelinePageResponse:
+    """Timeline is read from ``investigation_events`` (immutable, append-only).
+
+    The graph holds the structural view; this endpoint holds the
+    chronological one. They are intentionally separate per the
+    deterministic / AI-narrative split in CLAUDE.md invariant #5.
+    """
+    inv_exists = await session.scalar(
+        select(Investigation.id).where(Investigation.id == investigation_id)
+    )
+    if inv_exists is None:
+        raise HTTPException(status_code=404, detail="investigation not found")
+
+    stmt = (
+        select(InvestigationEvent)
+        .where(InvestigationEvent.investigation_id == investigation_id)
+        .order_by(InvestigationEvent.timestamp.asc(), InvestigationEvent.id.asc())
+        .offset(offset)
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    events = [
+        {
+            "event_id": str(row.id),
+            "event_type": row.event_type.value,
+            "timestamp": row.timestamp.isoformat(),
+            "source": row.source,
+            "actor": row.actor,
+            "target": row.target,
+            "evidence_refs": [str(x) for x in (row.evidence_refs or [])],
+            "confidence": row.confidence,
+            "metadata": dict(row.event_metadata or {}),
+        }
+        for row in rows
+    ]
+    return TimelinePageResponse(
+        investigation_id=investigation_id,
+        events=events,
+        limit=limit,
+        offset=offset,
     )
