@@ -35,6 +35,39 @@ from investigation.lifecycle.manager import InvalidTransitionError
 log = structlog.get_logger("exception")
 
 
+class WorkflowTimeoutError(Exception):
+    """Raised when a workflow exceeds ``orchestration.workflow_timeout_seconds``."""
+
+    def __init__(self, workflow_run_id: str, elapsed_seconds: float) -> None:
+        self.workflow_run_id = workflow_run_id
+        self.elapsed_seconds = elapsed_seconds
+        super().__init__(
+            f"workflow {workflow_run_id} timed out after {elapsed_seconds:.1f}s"
+        )
+
+
+class TokenBudgetExceededError(Exception):
+    """Raised when an LLM call would breach the per-investigation token budget."""
+
+    def __init__(self, investigation_id: str, requested: int, remaining: int) -> None:
+        self.investigation_id = investigation_id
+        self.requested = requested
+        self.remaining = remaining
+        super().__init__(
+            f"token budget exceeded for investigation {investigation_id}: "
+            f"requested={requested} remaining={remaining}"
+        )
+
+
+class AgentExecutionError(Exception):
+    """Raised when an agent run fails irrecoverably (after retries)."""
+
+    def __init__(self, agent_name: str, reason: str) -> None:
+        self.agent_name = agent_name
+        self.reason = reason
+        super().__init__(f"agent {agent_name} failed: {reason}")
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(
@@ -199,6 +232,52 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             content={"error": {"code": 504, "message": str(exc) or "firewall analysis timed out"}},
+        )
+
+    @app.exception_handler(WorkflowTimeoutError)
+    async def workflow_timeout_handler(
+        request: Request, exc: WorkflowTimeoutError
+    ) -> JSONResponse:
+        log.warning(
+            "workflow.timeout",
+            workflow_run_id=exc.workflow_run_id,
+            elapsed_seconds=exc.elapsed_seconds,
+            path=request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            content={"error": {"code": 504, "message": str(exc)}},
+        )
+
+    @app.exception_handler(TokenBudgetExceededError)
+    async def token_budget_handler(
+        request: Request, exc: TokenBudgetExceededError
+    ) -> JSONResponse:
+        log.warning(
+            "llm.token_budget_exceeded",
+            investigation_id=exc.investigation_id,
+            requested=exc.requested,
+            remaining=exc.remaining,
+            path=request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"error": {"code": 429, "message": str(exc)}},
+        )
+
+    @app.exception_handler(AgentExecutionError)
+    async def agent_execution_handler(
+        request: Request, exc: AgentExecutionError
+    ) -> JSONResponse:
+        log.warning(
+            "agent.execution_failed",
+            agent_name=exc.agent_name,
+            reason=exc.reason,
+            path=request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": {"code": 500, "message": str(exc)}},
         )
 
     @app.exception_handler(Exception)

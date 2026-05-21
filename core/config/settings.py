@@ -135,6 +135,80 @@ class FirewallSettings(BaseSettings):
     pii_masking_enabled: bool = True
 
 
+class LLMSettings(BaseSettings):
+    """LLM provider knobs (Phase 5).
+
+    When ``api_key`` is empty the platform uses ``StubLLM`` — deterministic
+    templated completions, zero network calls. Tests always run under this
+    mode so CI never needs an API key. When a key is set, ``OpenAIClient``
+    talks to any OpenAI-compatible endpoint (``base_url`` defaults to OpenAI;
+    point at a self-hosted proxy by overriding it).
+
+    The token budgets enforce ``PLAN.md`` §3.5: investigations cannot burn
+    more than ``max_tokens_per_investigation`` tokens across all agent runs.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="LLM_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    provider: str = "openai"
+    base_url: str = "https://api.openai.com/v1"
+    api_key: SecretStr = SecretStr("")
+    model: str = "gpt-4o-mini"
+    request_timeout_seconds: int = 60
+    max_tokens_per_request: int = 4_096
+    max_tokens_per_investigation: int = 50_000
+    max_retries: int = 2
+
+    @property
+    def has_api_key(self) -> bool:
+        return bool(self.api_key.get_secret_value().strip())
+
+
+class OrchestrationSettings(BaseSettings):
+    """Agent orchestration knobs (Phase 5).
+
+    These bound runaway workflows (``PLAN.md`` §3.5) — every workflow has a
+    hard wall-clock ceiling, every agent run a per-agent timeout, every
+    investigation a bounded memory footprint. Circuit-breaker defaults trip
+    after five consecutive failures within a one-minute window.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="ORCHESTRATION_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    enabled: bool = True
+    max_concurrent_workflows: int = 10
+    workflow_timeout_seconds: int = 600
+    agent_default_timeout_seconds: int = 120
+    agent_max_retries: int = 3
+
+    # Memory (PLAN §3 "Bounded AI Memory")
+    max_memory_depth: int = 50
+    max_tokens_per_memory: int = 2_048
+    max_total_tokens: int = 16_384
+    memory_ttl_seconds: int = 3_600
+    relevance_threshold: float = 0.5
+
+    # Circuit breaker
+    circuit_open_after_failures: int = 5
+    circuit_window_seconds: int = 60
+    circuit_open_duration_seconds: int = 30
+
+    # Reasoning prompt-safety dogfooding
+    reasoning_prompt_safety_enabled: bool = True
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -153,6 +227,8 @@ class Settings(BaseSettings):
     redis: RedisSettings = Field(default_factory=RedisSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     firewall: FirewallSettings = Field(default_factory=FirewallSettings)
+    llm: LLMSettings = Field(default_factory=LLMSettings)
+    orchestration: OrchestrationSettings = Field(default_factory=OrchestrationSettings)
 
 
 @lru_cache(maxsize=1)

@@ -18,6 +18,7 @@ from core.cache.redis import RedisClient
 from core.config.settings import Settings, get_settings
 from core.database.postgres import Database
 from core.events.emitter import EventEmitter
+from core.llm.client import LLMClient
 from evidence.store import EvidenceStore
 from firewall.service import FirewallService
 from graph.correlation.correlator import GraphCorrelator
@@ -27,6 +28,7 @@ from investigation.background import BackgroundTaskRunner
 from investigation.enrichment.executor import EnrichmentExecutor
 from investigation.ingestion.pipeline import IngestionPipeline
 from investigation.lifecycle.manager import LifecycleManager
+from orchestration.service import OrchestrationService
 from resolution.service import EntityResolutionService
 
 
@@ -86,6 +88,14 @@ def get_firewall_service(request: Request) -> FirewallService:
     return request.app.state.firewall_service  # type: ignore[no-any-return]
 
 
+def get_orchestration_service(request: Request) -> OrchestrationService:
+    return request.app.state.orchestration_service  # type: ignore[no-any-return]
+
+
+def get_llm_client(request: Request) -> LLMClient:
+    return request.app.state.llm_client  # type: ignore[no-any-return]
+
+
 async def get_db_session(
     db: Annotated[Database, Depends(get_database)],
 ) -> AsyncIterator[AsyncSession]:
@@ -108,3 +118,5 @@ LifecycleManagerDep = Annotated[LifecycleManager, Depends(get_lifecycle_manager)
 BackgroundRunnerDep = Annotated[BackgroundTaskRunner, Depends(get_background_runner)]
 IngestionPipelineDep = Annotated[IngestionPipeline, Depends(get_ingestion_pipeline)]
 FirewallServiceDep = Annotated[FirewallService, Depends(get_firewall_service)]
+OrchestrationServiceDep = Annotated[OrchestrationService, Depends(get_orchestration_service)]
+LLMClientDep = Annotated[LLMClient, Depends(get_llm_client)]

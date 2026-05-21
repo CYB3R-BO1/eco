@@ -31,12 +31,17 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 
+from agents.enrichment.agent import EnrichmentAgent
+from agents.ioc_correlation.agent import IOCCorrelationAgent
+from agents.reasoning.agent import ReasoningAgent
 from core.cache.redis import RedisClient
 from core.config.settings import Settings, get_settings
 from core.database.postgres import Database
 from core.events.emitter import EventEmitter
+from core.llm.budget import InvestigationTokenBudget
+from core.llm.client import build_llm_client
 from evidence.store import EvidenceStore
-from firewall.analysis.llm_classifier import NullClassifier
+from firewall.analysis.llm_classifier import NullClassifier, OpenAIClassifier
 from firewall.audit.store import FirewallAuditStore
 from firewall.correlation.correlator import FirewallGraphCorrelator
 from firewall.output_validation.validator import OutputValidator
@@ -56,6 +61,23 @@ from investigation.enrichment.providers import default_providers
 from investigation.enrichment.registry import ProviderRegistry
 from investigation.ingestion.pipeline import IngestionPipeline
 from investigation.lifecycle.manager import LifecycleManager
+from orchestration.dlq.store import DeadLetterStore
+from orchestration.memory.audit import MemoryAuditLogger
+from orchestration.retry.circuit_breaker import CircuitBreakerRegistry
+from orchestration.runtime.checkpointer import (
+    CheckpointerKind,
+    build_checkpointer,
+    setup_checkpointer,
+)
+from orchestration.service import OrchestrationService
+from orchestration.workflows.firewall import (
+    FirewallWorkflowDeps,
+    build_firewall_graph,
+)
+from orchestration.workflows.investigation import (
+    InvestigationWorkflowDeps,
+    build_investigation_graph,
+)
 from resolution.service import EntityResolutionService
 
 log = structlog.get_logger(__name__)
@@ -117,6 +139,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         graph_service=graph_service,
     )
 
+    # Phase 5 — LLM client (real if LLM_API_KEY is set, stub otherwise).
+    llm_client = build_llm_client(settings.llm)
+
     # Phase 4 services — AI firewall middleware.
     firewall_policy = FirewallPolicy(
         block_threshold=settings.firewall.block_threshold,
@@ -126,10 +151,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         pii_masking_enabled=settings.firewall.pii_masking_enabled,
     )
     firewall_audit_store = FirewallAuditStore()
+    # When the LLM has a real provider configured, upgrade the classifier
+    # from Phase 4's NullClassifier to the OpenAI-backed implementation.
+    llm_classifier = (
+        OpenAIClassifier(llm=llm_client)
+        if settings.llm.has_api_key
+        else NullClassifier()
+    )
     firewall_pipeline = PromptAnalysisPipeline(
         policy=firewall_policy,
         rules_engine=RulesEngine(),
-        llm_classifier=NullClassifier(),
+        llm_classifier=llm_classifier,
         detection_timeout_ms=settings.firewall.detection_timeout_ms,
     )
     firewall_policy_engine = PolicyEngine(firewall_policy)
@@ -153,6 +185,99 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         output_validator=firewall_output_validator,
     )
 
+    # Phase 5 — orchestration runtime. Wraps Phase 2/4 services in
+    # LangGraph nodes; owns workflow-run lifecycle + bounded memory + DLQs.
+    token_budget = InvestigationTokenBudget(
+        redis_client,
+        max_tokens_per_investigation=settings.llm.max_tokens_per_investigation,
+    )
+    circuit_breakers = CircuitBreakerRegistry(
+        open_after_failures=settings.orchestration.circuit_open_after_failures,
+        window_seconds=settings.orchestration.circuit_window_seconds,
+        open_duration_seconds=settings.orchestration.circuit_open_duration_seconds,
+    )
+    memory_audit_logger = MemoryAuditLogger()
+    dead_letter_store = DeadLetterStore()
+
+    enrichment_agent = EnrichmentAgent(
+        executor=enrichment_executor,
+        resolver=resolver,
+    )
+    correlation_agent = IOCCorrelationAgent(
+        correlator=graph_correlator,
+        graph_service=graph_service,
+    )
+    reasoning_agent = ReasoningAgent(
+        llm=llm_client,
+        firewall=firewall_service,
+        policy_engine=firewall_policy_engine,
+        evidence_store=evidence_store,
+        prompt_safety_enabled=settings.orchestration.reasoning_prompt_safety_enabled,
+    )
+
+    # Checkpointer — postgres-backed when the optional package is available,
+    # in-memory fallback otherwise. setup() is idempotent and creates the
+    # langgraph_checkpoints tables on first run (not in our Alembic).
+    checkpointer_ctx = await build_checkpointer(
+        settings.postgres,
+        prefer=CheckpointerKind.POSTGRES,
+    )
+    # AsyncPostgresSaver.from_conn_string returns an async context manager;
+    # MemorySaver does not. Enter the cm if applicable so the saver has a live
+    # connection pool for the lifetime of the app.
+    if hasattr(checkpointer_ctx, "__aenter__"):
+        checkpointer = await checkpointer_ctx.__aenter__()
+        app.state._checkpointer_ctx = checkpointer_ctx
+    else:
+        checkpointer = checkpointer_ctx
+        app.state._checkpointer_ctx = None
+    try:
+        await setup_checkpointer(checkpointer)
+    except Exception:
+        log.exception("lifespan.checkpointer_setup_failed_continuing_without_durability")
+
+    investigation_deps = InvestigationWorkflowDeps(
+        settings=settings.orchestration,
+        database=db,
+        redis=redis_client,
+        event_emitter=event_emitter,
+        evidence_store=evidence_store,
+        lifecycle_manager=lifecycle_manager,
+        llm=llm_client,
+        token_budget=token_budget,
+        circuit_breakers=circuit_breakers,
+        memory_audit=memory_audit_logger,
+        ingestion_pipeline=ingestion_pipeline,
+        enrichment_agent=enrichment_agent,
+        correlation_agent=correlation_agent,
+        reasoning_agent=reasoning_agent,
+    )
+    firewall_deps = FirewallWorkflowDeps(
+        settings=settings.orchestration,
+        database=db,
+        redis=redis_client,
+        event_emitter=event_emitter,
+        evidence_store=evidence_store,
+        lifecycle_manager=lifecycle_manager,
+        llm=llm_client,
+        token_budget=token_budget,
+        circuit_breakers=circuit_breakers,
+        memory_audit=memory_audit_logger,
+        firewall_service=firewall_service,
+        reasoning_agent=reasoning_agent,
+    )
+    workflow_graphs = {
+        "investigation": build_investigation_graph(
+            investigation_deps, checkpointer=checkpointer
+        ),
+        "firewall": build_firewall_graph(firewall_deps, checkpointer=checkpointer),
+    }
+    orchestration_service = OrchestrationService(
+        database=db,
+        event_emitter=event_emitter,
+        graphs=workflow_graphs,
+    )
+
     app.state.db = db
     app.state.redis = redis_client
     app.state.neo4j = neo4j_client
@@ -170,6 +295,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.firewall_service = firewall_service
     app.state.firewall_policy = firewall_policy
     app.state.firewall_audit_store = firewall_audit_store
+    app.state.llm_client = llm_client
+    app.state.token_budget = token_budget
+    app.state.circuit_breakers = circuit_breakers
+    app.state.memory_audit_logger = memory_audit_logger
+    app.state.dead_letter_store = dead_letter_store
+    app.state.orchestration_service = orchestration_service
+    app.state.checkpointer = checkpointer
 
     log.info("lifespan.startup.complete")
 
@@ -178,6 +310,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         log.info("lifespan.shutdown.begin")
         await background_runner.drain(timeout=30.0)
+        ctx = getattr(app.state, "_checkpointer_ctx", None)
+        if ctx is not None:
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                log.exception("lifespan.checkpointer_exit_failed")
         await neo4j_client.disconnect()
         await redis_client.disconnect()
         await db.disconnect()
