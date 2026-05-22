@@ -15,6 +15,11 @@ from typing import Any
 import structlog
 from neo4j import Record
 
+from core.observability.metrics import (
+    GRAPH_TRAVERSAL_DURATION_SECONDS,
+    depth_bucket,
+    time_histogram,
+)
 from graph.governance.cardinality import (
     MAX_QUERY_LIMIT,
     MAX_TRAVERSAL_DEPTH,
@@ -77,6 +82,16 @@ class GraphTraverser:
     ) -> GraphSlice:
         self._validator.validate_traversal_depth(depth)
         limit = _clamp_limit(limit)
+        with time_histogram(
+            GRAPH_TRAVERSAL_DURATION_SECONDS,
+            operation="neighborhood",
+            depth_bucket=depth_bucket(depth),
+        ):
+            return await self._neighborhood_inner(node_id, depth=depth, limit=limit)
+
+    async def _neighborhood_inner(
+        self, node_id: uuid.UUID, *, depth: int, limit: int
+    ) -> GraphSlice:
         async with self._client.driver.session(database=self._client.database) as session:
             try:
                 result = await asyncio.wait_for(
@@ -101,6 +116,14 @@ class GraphTraverser:
         return _flatten_path_records(records)
 
     async def investigation(self, investigation_id: uuid.UUID) -> GraphSlice:
+        with time_histogram(
+            GRAPH_TRAVERSAL_DURATION_SECONDS,
+            operation="investigation",
+            depth_bucket="1",
+        ):
+            return await self._investigation_inner(investigation_id)
+
+    async def _investigation_inner(self, investigation_id: uuid.UUID) -> GraphSlice:
         async with self._client.driver.session(database=self._client.database) as session:
             result = await asyncio.wait_for(
                 session.run(
@@ -123,6 +146,16 @@ class GraphTraverser:
     ) -> tuple[GraphNode, list[GraphEdge], list[GraphEdge]]:
         """One-hop view used by GET /graph/node/{id}: return node + its
         incoming and outgoing edges separately."""
+        with time_histogram(
+            GRAPH_TRAVERSAL_DURATION_SECONDS,
+            operation="node_with_neighbors",
+            depth_bucket="1",
+        ):
+            return await self._node_with_neighbors_inner(node_id)
+
+    async def _node_with_neighbors_inner(
+        self, node_id: uuid.UUID
+    ) -> tuple[GraphNode, list[GraphEdge], list[GraphEdge]]:
         async with self._client.driver.session(database=self._client.database) as session:
             result = await asyncio.wait_for(
                 session.run(
@@ -162,6 +195,26 @@ class GraphTraverser:
         limit = _clamp_limit(limit)
         rel_clause = render_rel_filter([r.value for r in (rel_types or [])])
         cypher = dsl_query(depth, rel_clause)
+        with time_histogram(
+            GRAPH_TRAVERSAL_DURATION_SECONDS,
+            operation="dsl_query",
+            depth_bucket=depth_bucket(depth),
+        ):
+            return await self._query_inner(
+                start_node_id,
+                cypher=cypher,
+                min_confidence=min_confidence,
+                limit=limit,
+            )
+
+    async def _query_inner(
+        self,
+        start_node_id: uuid.UUID,
+        *,
+        cypher: str,
+        min_confidence: float,
+        limit: int,
+    ) -> GraphSlice:
         async with self._client.driver.session(database=self._client.database) as session:
             result = await asyncio.wait_for(
                 session.run(

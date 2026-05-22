@@ -25,6 +25,7 @@ from core.config.settings import FirewallSettings
 from core.database.postgres import Database
 from core.events.emitter import EventEmitter
 from core.events.types import EventType
+from core.observability.metrics import FIREWALL_DECISIONS_TOTAL, risk_bucket
 from evidence.models import Evidence, Provenance
 from evidence.provenance import ProvenanceLevel
 from evidence.store import EvidenceStore
@@ -167,6 +168,10 @@ class FirewallService:
             idempotency_key=idempotency_key,
             correlation_id=correlation_id,
         )
+        FIREWALL_DECISIONS_TOTAL.labels(
+            decision=action.value,
+            risk_bucket=risk_bucket(report.risk_score),
+        ).inc()
         return outcome
 
     # ------------------------------------------------------------------

@@ -23,7 +23,15 @@ from dataclasses import dataclass, field
 
 import structlog
 
+from core.observability.metrics import CIRCUIT_BREAKER_STATE
+
 log = structlog.get_logger(__name__)
+
+_STATE_VALUES: dict[str, int] = {
+    "CLOSED": 0,
+    "HALF_OPEN": 1,
+    "OPEN": 2,
+}
 
 
 class CircuitState(str, enum.Enum):
@@ -73,6 +81,11 @@ class CircuitBreaker:
     def state(self) -> CircuitState:
         return self._record.state
 
+    def _publish_state(self) -> None:
+        CIRCUIT_BREAKER_STATE.labels(agent_name=self._key).set(
+            _STATE_VALUES[self._record.state.value]
+        )
+
     async def check(self) -> None:
         """Raise :class:`CircuitOpenError` if the breaker is open."""
         async with self._lock:
@@ -82,6 +95,7 @@ class CircuitBreaker:
                 if now - self._record.opened_at >= self._open_duration:
                     self._record.state = CircuitState.HALF_OPEN
                     log.info("circuit.half_open", key=self._key)
+                    self._publish_state()
                 else:
                     raise CircuitOpenError(self._key, self._record.opened_at)
 
@@ -93,6 +107,7 @@ class CircuitBreaker:
             self._record.opened_at = None
             if previous is not CircuitState.CLOSED:
                 log.info("circuit.closed", key=self._key, from_state=previous.value)
+            self._publish_state()
 
     async def on_failure(self) -> None:
         async with self._lock:
@@ -102,6 +117,7 @@ class CircuitBreaker:
                 self._record.state = CircuitState.OPEN
                 self._record.opened_at = now
                 log.warning("circuit.reopened_from_half_open", key=self._key)
+                self._publish_state()
                 return
             self._record.failures.append(now)
             cutoff = now - self._window
@@ -115,6 +131,7 @@ class CircuitBreaker:
                     failures=len(self._record.failures),
                     window_seconds=self._window,
                 )
+                self._publish_state()
 
 
 class CircuitBreakerRegistry:

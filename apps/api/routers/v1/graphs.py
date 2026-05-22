@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from apps.api.dependencies import GraphServiceDep
+from apps.api.rbac import requires
+from core.security.rbac import Permission
 from schemas.api.graph import (
     EdgeResponse,
     GraphQueryRequest,
@@ -42,6 +44,7 @@ def _edge_to_response(e) -> EdgeResponse:
     "/query",
     response_model=GraphSliceResponse,
     summary="Bounded graph traversal from a starting node",
+    dependencies=[Depends(requires(Permission.GRAPH_READ))],
 )
 async def query_graph(
     request: GraphQueryRequest,
@@ -64,6 +67,7 @@ async def query_graph(
     "/investigation/{investigation_id}",
     response_model=GraphSliceResponse,
     summary="Full subgraph anchored at an investigation",
+    dependencies=[Depends(requires(Permission.GRAPH_READ))],
 )
 async def get_investigation_subgraph(
     investigation_id: uuid.UUID,
@@ -80,6 +84,7 @@ async def get_investigation_subgraph(
     "/node/{node_id}",
     response_model=NodeWithNeighborsResponse,
     summary="A node plus its one-hop incoming and outgoing edges",
+    dependencies=[Depends(requires(Permission.GRAPH_READ))],
 )
 async def get_node(
     node_id: uuid.UUID,
@@ -97,6 +102,7 @@ async def get_node(
     "/integrity/{investigation_id}",
     response_model=IntegrityReportResponse,
     summary="On-demand integrity verification for an investigation",
+    dependencies=[Depends(requires(Permission.GRAPH_READ))],
 )
 async def get_integrity_report(
     investigation_id: uuid.UUID,

@@ -14,12 +14,18 @@ Phase 2 also maps the domain exceptions raised by the IOC pipeline
 """
 from __future__ import annotations
 
+import contextlib
+
 import structlog
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from core.events.types import EventType
+from core.observability.metrics import PERMISSION_DENIALS_TOTAL
+from core.security.hashing import sha256_hex
+from core.security.rbac import PermissionDeniedError
 from evidence.validation import EvidenceValidationError
 from firewall.service import FirewallTimeoutError, PromptTooLargeError
 from graph.governance.validator import (
@@ -66,6 +72,38 @@ class AgentExecutionError(Exception):
         self.agent_name = agent_name
         self.reason = reason
         super().__init__(f"agent {agent_name} failed: {reason}")
+
+
+async def _emit_permission_denied_event(
+    request: Request, exc: PermissionDeniedError
+) -> None:
+    """Best-effort fingerprint-only audit insert for an RBAC denial.
+
+    Uses a fresh DB session so the audit row commits independently of any
+    request-side transaction the caller might roll back. Failures are
+    swallowed because invariant #11 audit is a defense-in-depth signal —
+    the 403 itself is the primary signal and must not be blocked.
+    """
+    db = getattr(request.app.state, "db", None)
+    emitter = getattr(request.app.state, "event_emitter", None)
+    if db is None or emitter is None:
+        return
+    with contextlib.suppress(Exception):
+        async with db.session() as session:
+            await emitter.emit(
+                session,
+                EventType.AUTH_PERMISSION_DENIED,
+                source="rbac",
+                target=request.url.path,
+                actor=sha256_hex(exc.subject) if exc.subject else "unknown",
+                metadata={
+                    "role": exc.role,
+                    "permission": exc.permission.value,
+                    "method": request.method,
+                },
+                confidence=1.0,
+            )
+            await session.commit()
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -278,6 +316,36 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"error": {"code": 500, "message": str(exc)}},
+        )
+
+    @app.exception_handler(PermissionDeniedError)
+    async def permission_denied_handler(
+        request: Request, exc: PermissionDeniedError
+    ) -> JSONResponse:
+        """RBAC denial.
+
+        Emits a fingerprint-only audit row (subject + route SHA-256;
+        never the body) and bumps ``permission_denials_total``. The audit
+        write goes through a fresh session so it persists even when the
+        request session has already rolled back. If the data tier isn't
+        connected (e.g. in unit tests that don't run lifespan), the
+        audit insert silently fails — the 403 still fires.
+        """
+        PERMISSION_DENIALS_TOTAL.labels(
+            role=exc.role or "unknown",
+            permission=exc.permission.value,
+        ).inc()
+        log.warning(
+            "auth.permission_denied",
+            role=exc.role,
+            permission=exc.permission.value,
+            subject_fingerprint=sha256_hex(exc.subject) if exc.subject else None,
+            path=request.url.path,
+        )
+        await _emit_permission_denied_event(request, exc)
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"error": {"code": 403, "message": "permission_denied"}},
         )
 
     @app.exception_handler(Exception)

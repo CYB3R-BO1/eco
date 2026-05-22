@@ -35,8 +35,17 @@ from tenacity import (
 
 from core.config.settings import LLMSettings
 from core.llm.tokens import AITokenUsage, estimate_tokens
+from core.observability.metrics import LLM_TOKENS_USED_TOTAL
 
 log = structlog.get_logger(__name__)
+
+
+def _record_tokens(model: str, usage: AITokenUsage) -> None:
+    """Emit ``llm_tokens_used_total`` after a completion returns."""
+    if usage.input:
+        LLM_TOKENS_USED_TOTAL.labels(model=model, phase="input").inc(usage.input)
+    if usage.output:
+        LLM_TOKENS_USED_TOTAL.labels(model=model, phase="output").inc(usage.output)
 
 
 class LLMProviderError(RuntimeError):
@@ -105,6 +114,7 @@ class StubLLM:
             input_tokens=usage.input,
             output_tokens=usage.output,
         )
+        _record_tokens(self._model, usage)
         return LLMCompletion(
             text=text,
             usage=usage,
@@ -215,10 +225,13 @@ class OpenAIClient:
             output_tokens=output_tokens,
             finish_reason=finish_reason,
         )
+        usage = AITokenUsage(input=input_tokens, output=output_tokens)
+        response_model = body.get("model", self._settings.model)
+        _record_tokens(response_model, usage)
         return LLMCompletion(
             text=text,
-            usage=AITokenUsage(input=input_tokens, output=output_tokens),
-            model=body.get("model", self._settings.model),
+            usage=usage,
+            model=response_model,
             provider=self.provider_name,
             finish_reason=finish_reason,
         )

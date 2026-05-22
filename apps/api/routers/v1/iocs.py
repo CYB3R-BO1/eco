@@ -1,12 +1,14 @@
 """IOC ingestion + extraction endpoints."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from apps.api.dependencies import (
     EntityResolutionDep,
     IngestionPipelineDep,
 )
+from apps.api.rbac import requires
+from core.security.rbac import Permission
 from investigation.extraction.extractor import (
     TooLargeError,
     TooManyIocsError,
@@ -32,6 +34,7 @@ router = APIRouter(prefix="/iocs", tags=["iocs"])
     summary="Stateless IOC extraction",
     description="Run regex extraction + normalization over a text or JSON payload. "
     "Does not create an investigation and does not persist anything.",
+    dependencies=[Depends(requires(Permission.IOC_EXTRACT))],
 )
 async def extract_endpoint(
     body: ExtractRequest,
@@ -76,6 +79,7 @@ async def extract_endpoint(
     summary="Ingest an artifact and start an investigation",
     description="Creates an Investigation, records the raw artifact as Evidence, "
     "and triggers background extraction + enrichment. Returns immediately.",
+    dependencies=[Depends(requires(Permission.IOC_INGEST))],
 )
 async def ingest_endpoint(
     body: IngestRequest,

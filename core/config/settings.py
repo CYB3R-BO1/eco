@@ -13,7 +13,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["development", "testing", "production"]
@@ -209,6 +209,134 @@ class OrchestrationSettings(BaseSettings):
     reasoning_prompt_safety_enabled: bool = True
 
 
+class ObservabilitySettings(BaseSettings):
+    """Telemetry knobs (Phase 6).
+
+    ``otel_enabled`` and ``otlp_endpoint`` together gate the OpenTelemetry
+    exporter — when ``otel_enabled`` is false the ``TracerProvider`` is still
+    initialized (so ``get_tracer`` works), but no spans are exported. Setting
+    ``otlp_endpoint`` to e.g. ``http://localhost:4317`` enables OTLP gRPC push.
+
+    ``metrics_port`` exposes Prometheus on a SEPARATE listener (default bound
+    to loopback). The public API on port 8000 never serves ``/metrics`` —
+    that keeps the public surface auth-gated while the internal scrape stays
+    unauthenticated, per Prometheus convention.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OBSERVABILITY_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    otel_enabled: bool = False
+    otlp_endpoint: str | None = None
+    otel_insecure: bool = True
+
+    metrics_enabled: bool = True
+    metrics_port: int = 9090
+    metrics_bind_host: str = "127.0.0.1"
+
+    service_name: str = "platform-api"
+    service_version: str = "0.1.0"
+
+    slow_query_threshold_ms: int = 500
+
+
+class JWTKey(BaseModel):
+    """One signing key in the active keyset.
+
+    The active ``kid`` is whichever entry appears first in
+    ``SecuritySettings.jwt_keys``. Older ``kid`` entries remain present so
+    in-flight tokens issued under them continue to validate until they
+    expire (see ``POST /tokens/rotate-key``).
+    """
+
+    kid: str
+    secret: SecretStr
+
+
+class SecuritySettings(BaseSettings):
+    """Auth / hardening knobs (Phase 6 WP3 + WP5).
+
+    Auth is HS256 self-issued JWT — a closed-loop deployment with no
+    external IdP. ``jwt_keys`` is an ordered list of ``{kid, secret}``; the
+    first entry is the active signing key, later entries are
+    validation-only (used during rotation). ``bootstrap_admin_secret``
+    gates the admin-only ``POST /tokens/issue`` endpoint — set it once at
+    deploy time and store it like any other production secret.
+
+    Body- and rate-limit knobs are consumed by WP5 middleware. They live
+    here so every operator-facing security setting is in one place.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="SECURITY_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    jwt_keys: list[JWTKey] = Field(
+        default_factory=lambda: [JWTKey(kid="dev", secret=SecretStr("change-me-dev-only"))]
+    )
+    jwt_issuer: str = "ai-security-platform"
+    jwt_audience: str = "ai-security-platform"
+    jwt_algorithm: str = "HS256"
+    jwt_default_ttl_seconds: int = 3_600
+
+    bootstrap_admin_secret: SecretStr = SecretStr("")
+
+    # WP5 — used by hardening middleware. Declared now so the config surface
+    # is stable; middleware registration arrives in WP5.
+    max_body_bytes: int = 1_048_576
+    rate_limit_default: str = "120/minute"
+    rate_limit_burst: str = "240/minute"
+
+
+class RetentionSettings(BaseSettings):
+    """Retention TTLs (Phase 6 WP6).
+
+    Provenance-tiered TTLs match CLAUDE.md invariant #12. ``dry_run``
+    defaults to True everywhere except production — easier to validate
+    the SELECTs in staging without losing rows. ``archive_url`` is a
+    file:// or s3:// URL; when set, the events-retention job writes a
+    JSONL archive of fingerprint-only rows before deleting.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="RETENTION_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    evidence_primary_days: int = 180
+    evidence_derived_days: int = 90
+    evidence_third_party_days: int = 60
+    evidence_ai_generated_days: int = 30
+    evidence_user_supplied_days: int = 30
+
+    events_days: int = 180
+    firewall_events_days: int = 90
+    dlq_resolved_days: int = 30
+    memory_audits_days: int = 30
+    workflow_runs_days: int = 90
+
+    dry_run: bool = True
+    archive_url: str | None = None
+
+    # Scheduler tick. Default to daily at 02:30 UTC — late enough that the
+    # nightly DB maintenance window is over.
+    evidence_cron_hour: int = 2
+    evidence_cron_minute: int = 30
+    secure_deletion_interval_seconds: int = 60
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -229,6 +357,9 @@ class Settings(BaseSettings):
     firewall: FirewallSettings = Field(default_factory=FirewallSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
     orchestration: OrchestrationSettings = Field(default_factory=OrchestrationSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
+    retention: RetentionSettings = Field(default_factory=RetentionSettings)
 
 
 @lru_cache(maxsize=1)

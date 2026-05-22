@@ -18,6 +18,10 @@ from __future__ import annotations
 import asyncio
 import time
 
+from core.observability.metrics import (
+    FIREWALL_PIPELINE_DURATION_SECONDS,
+    time_histogram,
+)
 from core.security.hashing import sha256_hex
 from firewall.analysis import heuristics, normalization, patterns
 from firewall.analysis.llm_classifier import LLMClassifierProtocol, NullClassifier
@@ -52,26 +56,32 @@ class PromptAnalysisPipeline:
     async def _analyze(self, prompt: str, started: float) -> AnalysisReport:
         fingerprint = sha256_hex(prompt)
         # Layer 1
-        normalized = normalization.normalize(prompt)
+        with time_histogram(FIREWALL_PIPELINE_DURATION_SECONDS, stage="normalization"):
+            normalized = normalization.normalize(prompt)
         # Layers 2 + 3 (independent, run sequentially — both are pure CPU)
         signal_list: list[Signal] = []
-        signal_list.extend(heuristics.evaluate(normalized))
-        signal_list.extend(patterns.detect(normalized.text))
+        with time_histogram(FIREWALL_PIPELINE_DURATION_SECONDS, stage="heuristics"):
+            signal_list.extend(heuristics.evaluate(normalized))
+        with time_histogram(FIREWALL_PIPELINE_DURATION_SECONDS, stage="patterns"):
+            signal_list.extend(patterns.detect(normalized.text))
         # Layer 4: rules consume layers 1–3 output
-        signal_list.extend(self._rules.evaluate(normalized, signal_list))
+        with time_histogram(FIREWALL_PIPELINE_DURATION_SECONDS, stage="rules"):
+            signal_list.extend(self._rules.evaluate(normalized, signal_list))
         # Layer 5: LLM classifier (stub in Phase 4)
         llm_signals: list[Signal] = []
         llm_available = bool(getattr(self._llm, "available", False))
         if llm_available:
-            try:
-                llm_signals = await self._llm.classify(normalized)
-            except Exception:  # noqa: BLE001 — the LLM is best-effort
-                llm_signals = []
-                llm_available = False
+            with time_histogram(FIREWALL_PIPELINE_DURATION_SECONDS, stage="llm_classifier"):
+                try:
+                    llm_signals = await self._llm.classify(normalized)
+                except Exception:  # noqa: BLE001 — the LLM is best-effort
+                    llm_signals = []
+                    llm_available = False
         signal_list.extend(llm_signals)
 
         # Layer 6: scoring
-        score_result = score(signal_list, self._policy)
+        with time_histogram(FIREWALL_PIPELINE_DURATION_SECONDS, stage="scoring"):
+            score_result = score(signal_list, self._policy)
 
         # Pre-decision explainability (the policy engine will rebuild this
         # with the final reasoning summary; we attach matched rules /

@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 
 from apps.api.dependencies import SessionDep
+from apps.api.rbac import requires
+from core.security.rbac import Permission
 from schemas.api.graph import TimelinePageResponse
 from schemas.api.investigation import InvestigationResponse, TimelineEntry
 from storage.postgres.models.evidence import EvidenceRow
@@ -20,6 +22,7 @@ router = APIRouter(prefix="/investigations", tags=["investigations"])
     "/{investigation_id}",
     response_model=InvestigationResponse,
     summary="Fetch an investigation with its evidence and timeline",
+    dependencies=[Depends(requires(Permission.INVESTIGATION_READ))],
 )
 async def get_investigation(
     investigation_id: uuid.UUID,
@@ -78,6 +81,7 @@ async def get_investigation(
     "/{investigation_id}/timeline",
     response_model=TimelinePageResponse,
     summary="Paginated chronological replay of investigation events",
+    dependencies=[Depends(requires(Permission.INVESTIGATION_READ))],
 )
 async def get_investigation_timeline(
     investigation_id: uuid.UUID,

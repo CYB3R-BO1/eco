@@ -15,6 +15,7 @@ from typing import Any
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.observability.metrics import DLQ_DEPTH
 from storage.postgres.models.dead_letter_entry import DeadLetterEntry, DLQQueue
 
 log = structlog.get_logger(__name__)
@@ -62,6 +63,10 @@ class DeadLetterStore:
         )
         session.add(row)
         await session.flush()
+        # Live gauge — not the persisted count but a fast-incrementing
+        # operational signal that an entry was just written. A scheduled
+        # reconciler in WP6 corrects drift against the actual table count.
+        DLQ_DEPTH.labels(queue_name=queue_name.value).inc()
         log.warning(
             "dlq.record",
             queue=queue_name.value,

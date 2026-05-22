@@ -8,9 +8,11 @@ an optional persistence path when ``investigation_id`` is supplied.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header
 
 from apps.api.dependencies import FirewallServiceDep
+from apps.api.rbac import requires
+from core.security.rbac import Permission
 from firewall.models.prompt import ModelTarget, PromptInput, WorkflowContext
 from firewall.service import serialize_outcome
 from schemas.api.firewall import (
@@ -50,6 +52,7 @@ def _to_prompt_input(body: AnalyzeRequest) -> PromptInput:
     "/analyze",
     response_model=AnalysisResponse,
     summary="Analyze a prompt without persisting or correlating.",
+    dependencies=[Depends(requires(Permission.FIREWALL_USE))],
 )
 async def analyze(body: AnalyzeRequest, fw: FirewallServiceDep) -> AnalysisResponse:
     report = await fw.analyze(_to_prompt_input(body))
@@ -72,6 +75,7 @@ async def analyze(body: AnalyzeRequest, fw: FirewallServiceDep) -> AnalysisRespo
     "/decision",
     response_model=DecisionResponse,
     summary="Run firewall, persist the audit + investigation, and return the decision.",
+    dependencies=[Depends(requires(Permission.FIREWALL_USE))],
 )
 async def decide(
     body: DecisionRequest,
@@ -97,6 +101,7 @@ async def decide(
     "/validate-output",
     response_model=ValidateOutputResponse,
     summary="Validate a model response for leakage / hidden instructions / PII.",
+    dependencies=[Depends(requires(Permission.FIREWALL_USE))],
 )
 async def validate_output(
     body: ValidateOutputRequest,

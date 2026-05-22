@@ -25,21 +25,34 @@ Phase 1–3 plumbing.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import structlog
+import uvicorn
 from fastapi import FastAPI
 
 from agents.enrichment.agent import EnrichmentAgent
 from agents.ioc_correlation.agent import IOCCorrelationAgent
 from agents.reasoning.agent import ReasoningAgent
+from apps.api.metrics_app import create_metrics_app
 from core.cache.redis import RedisClient
 from core.config.settings import Settings, get_settings
 from core.database.postgres import Database
 from core.events.emitter import EventEmitter
 from core.llm.budget import InvestigationTokenBudget
 from core.llm.client import build_llm_client
+from core.observability.instrumentation import (
+    instrument_httpx,
+    instrument_neo4j,
+    instrument_redis,
+    instrument_sqlalchemy,
+)
+from core.database.slow_query_log import install_slow_query_logger
+from core.scheduler import build_scheduler
+from core.scheduler.jobs import retention_dlq, retention_events, retention_evidence, secure_deletion
 from evidence.store import EvidenceStore
 from firewall.analysis.llm_classifier import NullClassifier, OpenAIClassifier
 from firewall.audit.store import FirewallAuditStore
@@ -96,6 +109,47 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await db.connect()
     await redis_client.connect()
     await neo4j_client.connect()
+
+    # Phase 6 WP10 — slow-query listener. Template + SHA-256 of params only;
+    # never the bound values themselves (invariant #12).
+    if db._engine is not None:  # connect() guarantees this; noqa: SLF001
+        install_slow_query_logger(
+            db._engine,  # noqa: SLF001 — engine is meant to be reachable here
+            threshold_ms=settings.observability.slow_query_threshold_ms,
+        )
+
+    # Phase 6 — OpenTelemetry library instrumentation. Each call is a no-op
+    # if the optional instrumentation package isn't installed. Only meaningful
+    # when otel_enabled is true, since with no exporter the spans go nowhere.
+    if settings.observability.otel_enabled:
+        instrument_sqlalchemy(db.engine)
+        instrument_redis()
+        instrument_httpx()
+        instrument_neo4j()
+
+    # Phase 6 — Prometheus metrics server on a separate port. Runs as a
+    # sibling asyncio task; cancelled cleanly on shutdown.
+    metrics_task: asyncio.Task[None] | None = None
+    metrics_server: uvicorn.Server | None = None
+    if settings.observability.metrics_enabled:
+        metrics_config = uvicorn.Config(
+            app=create_metrics_app(),
+            host=settings.observability.metrics_bind_host,
+            port=settings.observability.metrics_port,
+            log_level="warning",
+            lifespan="off",
+            access_log=False,
+        )
+        metrics_server = uvicorn.Server(metrics_config)
+        metrics_server.config.setup_event_loop()
+        metrics_task = asyncio.create_task(
+            metrics_server.serve(), name="metrics-server"
+        )
+        log.info(
+            "lifespan.metrics_server.started",
+            host=settings.observability.metrics_bind_host,
+            port=settings.observability.metrics_port,
+        )
 
     # Phase 2 services
     event_emitter = EventEmitter()
@@ -303,12 +357,58 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.orchestration_service = orchestration_service
     app.state.checkpointer = checkpointer
 
+    # Phase 6 WP6 — embedded scheduler. APScheduler is optional; if not
+    # installed (e.g. minimal test image), the scheduler is None and no
+    # retention jobs run. Per-job advisory locks guard against multi-worker
+    # fan-out (see core.scheduler.locks).
+    scheduler = build_scheduler()
+    if scheduler is not None:
+        scheduler.add_job(
+            retention_evidence.run,
+            "cron",
+            hour=settings.retention.evidence_cron_hour,
+            minute=settings.retention.evidence_cron_minute,
+            args=[db, settings.retention],
+            id=retention_evidence.JOB_NAME,
+        )
+        scheduler.add_job(
+            retention_events.run,
+            "cron",
+            hour=settings.retention.evidence_cron_hour,
+            minute=settings.retention.evidence_cron_minute + 5,
+            args=[db, settings.retention],
+            id=retention_events.JOB_NAME,
+        )
+        scheduler.add_job(
+            retention_dlq.run,
+            "cron",
+            hour=settings.retention.evidence_cron_hour,
+            minute=settings.retention.evidence_cron_minute + 10,
+            args=[db, settings.retention],
+            id=retention_dlq.JOB_NAME,
+        )
+        scheduler.add_job(
+            secure_deletion.run,
+            "interval",
+            seconds=settings.retention.secure_deletion_interval_seconds,
+            args=[db, settings.retention],
+            id=secure_deletion.JOB_NAME,
+        )
+        scheduler.start()
+        log.info("lifespan.scheduler.started")
+    app.state.scheduler = scheduler
+
     log.info("lifespan.startup.complete")
 
     try:
         yield
     finally:
         log.info("lifespan.shutdown.begin")
+        if scheduler is not None:
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                log.exception("lifespan.scheduler.shutdown_failed")
         await background_runner.drain(timeout=30.0)
         ctx = getattr(app.state, "_checkpointer_ctx", None)
         if ctx is not None:
@@ -316,6 +416,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await ctx.__aexit__(None, None, None)
             except Exception:
                 log.exception("lifespan.checkpointer_exit_failed")
+        if metrics_server is not None:
+            metrics_server.should_exit = True
+        if metrics_task is not None:
+            metrics_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await metrics_task
+            log.info("lifespan.metrics_server.stopped")
         await neo4j_client.disconnect()
         await redis_client.disconnect()
         await db.disconnect()

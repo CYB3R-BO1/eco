@@ -18,6 +18,7 @@ import structlog
 
 from core.events.emitter import EventEmitter
 from core.events.types import EventType
+from core.observability.metrics import ENRICHMENT_TOTAL
 from evidence.models import Evidence, Provenance
 from evidence.provenance import ProvenanceLevel
 from evidence.store import EvidenceStore
@@ -147,9 +148,11 @@ class EnrichmentExecutor:
             await self._persist_success(
                 provider, entity, result, investigation_id, ioc_evidence_id, chain_of_custody
             )
+            ENRICHMENT_TOTAL.labels(source=provider.name, status="success").inc()
         else:
             await breaker.record_failure()
             await self._persist_failure(provider, entity, result, investigation_id, ioc_evidence_id)
+            ENRICHMENT_TOTAL.labels(source=provider.name, status="failure").inc()
 
         return result
 

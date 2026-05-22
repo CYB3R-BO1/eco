@@ -1,3 +1,6 @@
+# Phase 6 WP8 — explicit allow-list-ish ignore. Anything that should not
+# end up baked into the image lives here. Local dev caches, secrets, IDE
+# scratch, and operator artefacts (backups, load-test results) are out.
 .git
 .github
 .gitignore
@@ -17,3 +20,13 @@ coverage.xml
 .env.local
 .env.*.local
 docker-compose.override.yml
+docker-compose.prod.yml
+backups/
+load-results/
+locust_reports/
+*.dump
+*.sql
+.idea/
+.vscode/
+*.log
+docs/

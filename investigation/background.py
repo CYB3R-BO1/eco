@@ -15,6 +15,8 @@ from typing import Any
 
 import structlog
 
+from core.observability.metrics import WORKFLOW_ACTIVE
+
 log = structlog.get_logger(__name__)
 
 
@@ -26,8 +28,13 @@ class BackgroundTaskRunner:
     def run(self, coro: Coroutine[Any, Any, Any], *, name: str | None = None) -> asyncio.Task[Any]:
         task = asyncio.create_task(self._wrap(coro), name=name)
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        WORKFLOW_ACTIVE.set(len(self._tasks))
+        task.add_done_callback(self._on_done)
         return task
+
+    def _on_done(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        WORKFLOW_ACTIVE.set(len(self._tasks))
 
     async def _wrap(self, coro: Coroutine[Any, Any, Any]) -> None:
         async with self._semaphore:

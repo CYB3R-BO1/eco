@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, TypeVar
 
 import structlog
 
+from core.observability.metrics import AGENT_RETRIES_TOTAL
 from orchestration.retry.policies import RetryPolicy
 
 log = structlog.get_logger(__name__)
@@ -59,6 +60,10 @@ def retry(
                         next_delay_ms=int(delay * 1000),
                         exception_type=type(exc).__name__,
                     )
+                    AGENT_RETRIES_TOTAL.labels(
+                        agent_name=policy.name,
+                        reason=type(exc).__name__,
+                    ).inc()
                     if on_retry is not None:
                         try:
                             await on_retry(attempt, delay, exc)

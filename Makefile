@@ -1,4 +1,4 @@
-.PHONY: help up down build logs api migrate revision test lint format type-check pre-commit-install clean
+.PHONY: help up down build logs api migrate revision test lint format type-check pre-commit-install clean backup backup-pg backup-neo4j restore-pg restore-neo4j retention-dryrun load-test
 
 help: ## Show available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-22s %s\n", $$1, $$2}'
@@ -41,3 +41,44 @@ pre-commit-install: ## Install git pre-commit hooks on the host
 
 clean: ## Tear down everything including volumes
 	docker compose down -v
+
+# ---------------------------------------------------------------------------
+# Phase 6 WP7 — backups
+# ---------------------------------------------------------------------------
+
+backup: backup-pg backup-neo4j ## Run a full backup (postgres + neo4j)
+
+backup-pg: ## Dump Postgres into ./backups
+	@mkdir -p backups
+	docker compose exec -T -e POSTGRES_HOST=postgres -e POSTGRES_USER=platform \
+		-e POSTGRES_DB=platform -e POSTGRES_PASSWORD=platform \
+		-e BACKUP_DIR=/app/backups api bash /app/infra/backup/pg_backup.sh
+
+backup-neo4j: ## Dump Neo4j into the neo4j container's import dir
+	docker compose exec -T neo4j bash /docker-entrypoint-initdb.d/neo4j_backup.sh || \
+		docker compose exec -T neo4j neo4j-admin database dump neo4j --to-path=/var/lib/neo4j/import --overwrite-destination
+
+restore-pg: ## Restore Postgres from FILE (usage: make restore-pg FILE=backups/postgres-….dump)
+	@test -n "$(FILE)" || (echo "FILE=… required" && exit 2)
+	docker compose exec -T -e POSTGRES_HOST=postgres -e POSTGRES_USER=platform \
+		-e POSTGRES_DB=platform -e POSTGRES_PASSWORD=platform \
+		api bash /app/infra/backup/pg_restore.sh --force /app/$(FILE)
+
+restore-neo4j: ## Restore Neo4j from a dump (usage: make restore-neo4j FILE=…)
+	@test -n "$(FILE)" || (echo "FILE=… required" && exit 2)
+	docker compose exec -T neo4j bash /app/infra/backup/neo4j_restore.sh $(FILE)
+
+# ---------------------------------------------------------------------------
+# Phase 6 WP6 — retention
+# ---------------------------------------------------------------------------
+
+retention-dryrun: ## Run every retention job in dry-run mode and report counts
+	docker compose exec api python -m infra.scripts.retention_dryrun
+
+# ---------------------------------------------------------------------------
+# Phase 6 WP10 — load testing
+# ---------------------------------------------------------------------------
+
+load-test: ## Run the Locust smoke load test for 60s
+	docker compose run --rm -e LOCUST_HEADLESS=1 api \
+		locust -f tests/load/locustfile.py --headless -u 10 -r 2 -t 60s --host http://api:8000

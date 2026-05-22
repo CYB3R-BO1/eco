@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from apps.api.dependencies import OrchestrationServiceDep
+from apps.api.rbac import requires
+from core.security.rbac import Permission
 from schemas.api.workflows import WorkflowDetailResponse
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
@@ -19,6 +21,7 @@ router = APIRouter(prefix="/workflows", tags=["workflows"])
     "/{workflow_run_id}",
     response_model=WorkflowDetailResponse,
     summary="Workflow run detail (header + agent runs).",
+    dependencies=[Depends(requires(Permission.WORKFLOW_READ))],
 )
 async def get_workflow(
     workflow_run_id: uuid.UUID,

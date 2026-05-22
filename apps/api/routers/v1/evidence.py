@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from apps.api.dependencies import EvidenceStoreDep, SessionDep
+from apps.api.rbac import requires
+from core.security.rbac import Permission
 from schemas.api.evidence import EvidenceResponse, ProvenanceResponse
 
 router = APIRouter(prefix="/evidence", tags=["evidence"])
@@ -15,6 +17,7 @@ router = APIRouter(prefix="/evidence", tags=["evidence"])
     "/{evidence_id}",
     response_model=EvidenceResponse,
     summary="Fetch a single Evidence record with full provenance",
+    dependencies=[Depends(requires(Permission.EVIDENCE_READ))],
 )
 async def get_evidence(
     evidence_id: uuid.UUID,

@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.events.emitter import EventEmitter
 from core.events.types import EventType
+from core.observability.metrics import GRAPH_WRITES_TOTAL
 from graph.governance.cardinality import MAX_RELATIONSHIPS_PER_NODE
 from graph.governance.node_types import NodeType
 from graph.governance.relationship_types import RelationshipType
@@ -161,6 +162,10 @@ class GraphMutator:
                 node_id=str(node_id),
                 investigation_id=str(investigation_id) if investigation_id else None,
             )
+        GRAPH_WRITES_TOTAL.labels(
+            label=label.value,
+            op="upsert_node_new" if was_new else "upsert_node_existing",
+        ).inc()
         return MutationResult(id=node_id, was_new=was_new)
 
     async def upsert_entity_node(
@@ -369,4 +374,8 @@ class GraphMutator:
                 target=f"{target_type.value}:{target_id}",
                 investigation_id=str(investigation_id) if investigation_id else None,
             )
+        GRAPH_WRITES_TOTAL.labels(
+            label=rel.value,
+            op="relationship_new" if was_new else "relationship_existing",
+        ).inc()
         return MutationResult(id=fingerprint, was_new=was_new)

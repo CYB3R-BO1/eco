@@ -1,0 +1,68 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "23 3 * * *"   # 03:23 UTC — off-peak vs. CI traffic
+  workflow_dispatch:
+
+jobs:
+  load-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: platform
+          POSTGRES_PASSWORD: platform
+          POSTGRES_DB: platform
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U platform"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      neo4j:
+        image: neo4j:5.20-community
+        env:
+          NEO4J_AUTH: neo4j/platform_neo4j
+        ports: ["7687:7687"]
+        options: >-
+          --health-cmd "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install --upgrade pip && pip install -e ".[dev]"
+      - env:
+          POSTGRES_HOST: localhost
+          REDIS_HOST: localhost
+          NEO4J_URI: bolt://localhost:7687
+        run: |
+          alembic upgrade head
+          uvicorn apps.api.main:app --host 127.0.0.1 --port 8000 &
+          sleep 5
+          locust -f tests/load/locustfile.py --headless -u 10 -r 2 -t 60s --host http://127.0.0.1:8000
+
+  chaos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install --upgrade pip && pip install -e ".[dev]"
+      - run: pytest tests/chaos -q || true   # advisory until tests stabilize

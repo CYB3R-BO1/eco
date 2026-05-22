@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from apps.api.dependencies import OrchestrationServiceDep
+from apps.api.rbac import requires
+from core.security.rbac import Permission
 from schemas.api.agents import (
     AgentStatusResponse,
     RunWorkflowRequest,
@@ -33,6 +35,7 @@ router = APIRouter(prefix="/agents", tags=["agents"])
     response_model=RunWorkflowResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Start an orchestration workflow.",
+    dependencies=[Depends(requires(Permission.AGENT_EXECUTE))],
 )
 async def run_workflow(
     body: RunWorkflowRequest,
@@ -67,6 +70,7 @@ async def run_workflow(
     "/status/{workflow_run_id}",
     response_model=AgentStatusResponse,
     summary="Get the current status of a workflow run.",
+    dependencies=[Depends(requires(Permission.WORKFLOW_READ))],
 )
 async def get_status(
     workflow_run_id: uuid.UUID,

@@ -21,6 +21,20 @@ services:
       neo4j:
         condition: service_healthy
     restart: unless-stopped
+    # Phase 6 WP7 — mount the backup directory so backup-pg / restore-pg
+    # Make targets land their dumps somewhere durable on the host.
+    # Phase 6 WP8 — container hardening (cap_drop, no-new-privileges,
+    # read-only FS with /tmp tmpfs). Distroless intentionally NOT used —
+    # operators need /bin/bash for runbook entrypoints.
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    tmpfs:
+      - /tmp
+    # NOTE: read_only:true is desirable in prod but conflicts with the
+    # bind-mounted volume:./:/app used for dev hot-reload. Enable it in
+    # the prod overlay (docker-compose.prod.yml) — see WP8 docs.
 
   postgres:
     image: postgres:16-alpine
@@ -43,6 +57,16 @@ services:
   redis:
     image: redis:7-alpine
     container_name: platform-redis
+    # Phase 6 WP7 — periodic RDB snapshots. The three triplets mean: dump
+    # if 1 key changes in 900s, 10 in 300s, or 10000 in 60s. Combined
+    # with appendonly=no this gives a low-cost RPO of ~15 minutes that
+    # matches the runbook target.
+    command:
+      - redis-server
+      - --save
+      - "900 1 300 10 60 10000"
+      - --appendonly
+      - "no"
     ports:
       - "6379:6379"
     volumes:
