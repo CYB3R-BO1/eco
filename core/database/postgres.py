@@ -61,6 +61,19 @@ class Database:
         self._sessionmaker = None
         log.info("postgres.disconnected")
 
+    @property
+    def engine(self) -> AsyncEngine:
+        """Public accessor for the underlying engine.
+
+        Used by Phase 6 telemetry to attach the slow-query listener and
+        by ad-hoc maintenance scripts. Raises if called before
+        :meth:`connect` so callers get a clear error rather than an
+        ``AttributeError`` on ``None``.
+        """
+        if self._engine is None:
+            raise RuntimeError("Database is not connected")
+        return self._engine
+
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
         if self._sessionmaker is None:

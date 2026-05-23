@@ -24,19 +24,32 @@ from core.security.hashing import sha256_hex
 log = structlog.get_logger(__name__)
 
 
+# Sentinel attribute set on an engine once a listener pair has been
+# attached. SQLAlchemy ``event.listens_for`` registers globally and
+# doesn't deduplicate, so a second call would double-log every query.
+# Tests that build multiple engines hit this constantly without the
+# guard.
+_INSTALLED_ATTR = "_ai_security_slow_query_installed"
+
+
 def install_slow_query_logger(engine: Engine, *, threshold_ms: int) -> None:
-    """Wire the listener pair onto ``engine``.
+    """Wire the listener pair onto ``engine``. Idempotent.
 
-    Idempotent: calling twice on the same engine attaches the listener
-    twice and would double-log. Callers should call exactly once at
-    startup, after the engine is constructed.
+    Phase 7 WP3: a sentinel attribute on the engine prevents
+    double-attach. Calling this function repeatedly on the same engine
+    is now a no-op — important for test fixtures that build engines per
+    test and for lifespan retries during reconnect.
     """
+    target = engine.sync_engine if hasattr(engine, "sync_engine") else engine
+    if getattr(target, _INSTALLED_ATTR, False):
+        log.debug("slow_query_logger.already_installed")
+        return
 
-    @event.listens_for(engine.sync_engine if hasattr(engine, "sync_engine") else engine, "before_cursor_execute")
+    @event.listens_for(target, "before_cursor_execute")
     def _before(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
         context._slow_query_start = time.perf_counter()  # type: ignore[attr-defined]
 
-    @event.listens_for(engine.sync_engine if hasattr(engine, "sync_engine") else engine, "after_cursor_execute")
+    @event.listens_for(target, "after_cursor_execute")
     def _after(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
         start = getattr(context, "_slow_query_start", None)
         if start is None:
@@ -52,6 +65,8 @@ def install_slow_query_logger(engine: Engine, *, threshold_ms: int) -> None:
             executemany=bool(executemany),
             threshold_ms=threshold_ms,
         )
+
+    setattr(target, _INSTALLED_ATTR, True)
 
 
 def _normalize_statement(statement: str) -> str:

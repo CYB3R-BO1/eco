@@ -27,6 +27,26 @@ def test_admin_has_every_permission() -> None:
     assert ROLE_MATRIX[Role.ADMIN] == frozenset(Permission)
 
 
+def test_admin_holds_each_permission_by_name() -> None:
+    """Phase 7 WP1 — pin the contract member-by-member.
+
+    The matrix entry ``Role.ADMIN: frozenset(Permission)`` relies on
+    ``frozenset(EnumClass)`` iterating to all members. A future refactor
+    that swaps the right-hand side to ``frozenset(set(Permission))`` or
+    a comprehension would still pass the equality test above if the
+    derivation is correct — but a typo like ``frozenset({Permission})``
+    (wrapping the enum class itself in a literal set) would silently
+    yield a one-element set. Iterating each known permission catches
+    that class of regression directly.
+    """
+    perms = ROLE_MATRIX[Role.ADMIN]
+    for permission in Permission:
+        assert permission in perms, (
+            f"ADMIN role is missing {permission.value!r} — "
+            "the RBAC matrix is broken"
+        )
+
+
 @pytest.mark.parametrize("role", [Role.READONLY, Role.AI_AGENT, Role.SERVICE_ACCOUNT])
 def test_non_write_roles_lack_investigation_write(role: Role) -> None:
     assert Permission.INVESTIGATION_WRITE not in ROLE_MATRIX[role]

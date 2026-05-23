@@ -52,7 +52,13 @@ from core.observability.instrumentation import (
 )
 from core.database.slow_query_log import install_slow_query_logger
 from core.scheduler import build_scheduler
-from core.scheduler.jobs import retention_dlq, retention_events, retention_evidence, secure_deletion
+from core.scheduler.jobs import (
+    retention_dlq,
+    retention_events,
+    retention_evidence,
+    retention_idempotency,
+    secure_deletion,
+)
 from evidence.store import EvidenceStore
 from firewall.analysis.llm_classifier import NullClassifier, OpenAIClassifier
 from firewall.audit.store import FirewallAuditStore
@@ -111,12 +117,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await neo4j_client.connect()
 
     # Phase 6 WP10 — slow-query listener. Template + SHA-256 of params only;
-    # never the bound values themselves (invariant #12).
-    if db._engine is not None:  # connect() guarantees this; noqa: SLF001
-        install_slow_query_logger(
-            db._engine,  # noqa: SLF001 — engine is meant to be reachable here
-            threshold_ms=settings.observability.slow_query_threshold_ms,
-        )
+    # never the bound values themselves (invariant #12). Phase 7 WP4 swapped
+    # the private-attr access for ``db.engine``.
+    install_slow_query_logger(
+        db.engine,
+        threshold_ms=settings.observability.slow_query_threshold_ms,
+    )
 
     # Phase 6 — OpenTelemetry library instrumentation. Each call is a no-op
     # if the optional instrumentation package isn't installed. Only meaningful
@@ -388,6 +394,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             id=retention_dlq.JOB_NAME,
         )
         scheduler.add_job(
+            retention_idempotency.run,
+            "cron",
+            hour=settings.retention.evidence_cron_hour,
+            minute=settings.retention.evidence_cron_minute + 15,
+            args=[db, settings.retention],
+            id=retention_idempotency.JOB_NAME,
+        )
+        scheduler.add_job(
             secure_deletion.run,
             "interval",
             seconds=settings.retention.secure_deletion_interval_seconds,
@@ -409,6 +423,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 scheduler.shutdown(wait=False)
             except Exception:
                 log.exception("lifespan.scheduler.shutdown_failed")
+        # Phase 7 WP1 — drain orchestration workflow tasks BEFORE the
+        # generic background runner; orchestration tasks own their own
+        # DB transactions and need their session pool intact.
+        try:
+            await orchestration_service.drain(timeout=30.0)
+        except Exception:
+            log.exception("lifespan.orchestration_drain_failed")
         await background_runner.drain(timeout=30.0)
         ctx = getattr(app.state, "_checkpointer_ctx", None)
         if ctx is not None:
@@ -420,8 +441,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             metrics_server.should_exit = True
         if metrics_task is not None:
             metrics_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await metrics_task
+            # Phase 7 WP3 — bounded wait. A hung metrics request would
+            # otherwise delay process exit indefinitely; 5 s is plenty
+            # for the loop to observe the cancel.
+            try:
+                await asyncio.wait_for(metrics_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                log.warning("lifespan.metrics_server.cancel_timed_out")
+            except (asyncio.CancelledError, Exception):
+                pass
             log.info("lifespan.metrics_server.stopped")
         await neo4j_client.disconnect()
         await redis_client.disconnect()

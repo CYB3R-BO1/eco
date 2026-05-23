@@ -62,3 +62,28 @@ via the same node's Prometheus agent.
 
 See `docs/runbooks/backup-restore.md`. RPO 15 min, RTO 1 h. The graph
 is rebuilt from Postgres event replay as the primary recovery path.
+
+## Connection pool sizing
+
+`POSTGRES_POOL_SIZE` (default 10) and `POSTGRES_MAX_OVERFLOW` (default 20)
+give 30 max connections per process. With the default uvicorn
+`--workers 4` and average concurrency of ~8 sessions per worker during
+ingest bursts, the pool runs at ~80% saturation under nominal load and
+spills to overflow during spikes.
+
+Sizing formula:
+```
+pool_size + max_overflow ≥ workers × peak_concurrent_sessions
+```
+
+If you raise `--workers`, raise `POSTGRES_POOL_SIZE` proportionally and
+verify your Postgres instance's `max_connections` (default 100) covers
+all uvicorn processes × pool_size. Connection saturation surfaces as
+slow `db.session_acquire` log lines and high p99 latency without a
+matching `db.slow_query`.
+
+The firewall decision flow holds a PG session across multiple Neo4j
+MERGEs in the graph correlator step (one session per
+`_persist_decision`). Under sustained Neo4j slowness this is the most
+likely place to see pool exhaustion — monitor `postgres.healthcheck`
+failures and Neo4j p99 together when sizing.

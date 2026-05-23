@@ -3,6 +3,21 @@
 Triggered by `RetentionJobFailed` alert when
 `retention_job_runs_total{outcome="error"}` increments.
 
+## Jobs in scope
+
+| Job | TTL setting | Default | Purpose |
+|---|---|---|---|
+| `retention_evidence` | `retention.evidence_days` (by provenance) | PRIMARY 180d → AI_GENERATED 30d | Evidence table by provenance level |
+| `retention_events` | `retention.investigation_events_days` | 90d | `investigation_events` audit rows |
+| `retention_audit` | `retention.audit_log_days` | 365d | `audit_log` rows |
+| `retention_workflow` | `retention.workflow_runs_days` | 60d | `workflow_runs` history |
+| `retention_idempotency` | `retention.idempotency_keys_hours` | 24h | `idempotency_keys` short-TTL cache (Phase 7 WP2) |
+
+`retention_idempotency` fires at the same cron as the others but offset
+by +15 min to avoid lock-step contention. It uses the same
+`pg_try_advisory_lock` primitive and the same `outcome="error"` metric
+on failure.
+
 ## Diagnose
 
 ```bash
@@ -29,6 +44,7 @@ The retention scheduler retries on the next cron tick (default daily
 ```bash
 make retention-dryrun                  # preview the planned counts
 docker compose exec api python -m core.scheduler.jobs.retention_evidence
+docker compose exec api python -m core.scheduler.jobs.retention_idempotency
 ```
 
 ## Verify

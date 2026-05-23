@@ -1,33 +1,39 @@
-"""HTTP idempotency replay (Phase 6 WP5).
+"""HTTP idempotency replay (Phase 6 WP5, refined in Phase 7 WP1).
 
-Generalizes the firewall-specific idempotency cache so any mutating
-route can opt in via a FastAPI dependency. The key shape is
-``idempotency:{kid}:{idempotency_key}`` so two different tenants (when
-multi-tenancy lands as an additive concern) can re-use idempotency keys
-without collision.
+Per-route dependency that records an ``Idempotency-Key`` for a request,
+checks Redis for a prior result keyed by the authenticated subject, and
+either short-circuits the handler with a replay response or lets the
+handler run and persists the body fingerprint for next time.
+
+Why dependency, not ASGI middleware: the previous incarnation ran in
+the ASGI stack BEFORE the auth dependency could resolve the principal,
+so the cache key fell back to ``"anon"`` for every request. Two callers
+sharing an ``Idempotency-Key`` would see each other's responses. The
+dependency form runs after :func:`apps.api.auth.get_current_principal`,
+so the cache key is always scoped by the verified ``subject`` claim.
 
 The cached value stores ``status``, ``body_fingerprint``, and
-``correlation_id`` — never the response body itself. Replays return a
-slim header-only response carrying the original status code and a
-``X-Idempotent-Replay: true`` marker; clients can then re-fetch the
-full state through the normal read API if they need it. Storing the
-body fingerprint (SHA-256) lets us assert the second call's response
-matches the first without persisting raw content (invariant #12).
+``correlation_id`` — never the raw body. Replays return a slim
+header-only response carrying the original status code and an
+``X-Idempotent-Replay: true`` marker; clients can re-fetch the full
+state through the read API if they need it. Storing the body
+fingerprint (SHA-256) lets a future high-stakes route assert the
+second call's response matches the first without persisting raw
+content (invariant #12).
 
 This is the HTTP-cache layer. The pipeline-level idempotency keys
 (``IdempotencyKeyRow``) remain authoritative for "did we already
-create this row" — the two layers compose: HTTP cache short-circuits
+create this row?" — the two layers compose: HTTP cache short-circuits
 the second call entirely; the row-level guard handles the case where
 two callers race past the cache window.
 """
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from typing import Annotated
+from typing import Annotated, Any
 
 import orjson
 import structlog
-from fastapi import Depends, Header, Request, Response
+from fastapi import Depends, Header, HTTPException, Request, Response
 
 from apps.api.auth import get_current_principal
 from core.security.hashing import sha256_hex
@@ -35,84 +41,55 @@ from core.security.principal import Principal
 
 log = structlog.get_logger(__name__)
 
-# 24-hour replay window. Tunable later via settings if a route needs longer
-# protection — most APIs use 24h as the standard idempotency-key TTL.
+# 24-hour replay window. Matches the IdempotencyKeyRow retention TTL so
+# the two layers age out together.
 _IDEMPOTENCY_TTL_SECONDS = 86_400
 _REPLAY_HEADER = "X-Idempotent-Replay"
 
 
-class IdempotencyConflictError(Exception):
-    """Same key, different body fingerprint — RFC 7231 / idempotency-key spec.
+class IdempotencyConflictError(HTTPException):
+    """Same key, different body fingerprint — RFC-style idempotency conflict.
 
     The caller previously used this key with a different request payload.
     Either the client is reusing keys without intent, or there's a
-    collision in their key-generation scheme. Mapped to 422 by the
-    handler in ``apps/api/exceptions.py``.
+    collision in their key-generation scheme. Maps to HTTP 422.
     """
 
     def __init__(self, key: str) -> None:
-        super().__init__(f"idempotency key {key!r} reused with different body")
-        self.key = key
+        super().__init__(
+            status_code=422,
+            detail=f"idempotency key {key!r} reused with a different request body",
+        )
 
 
-async def _enforce(
-    request: Request,
-    idempotency_key: str | None,
-    principal: Principal | None,
-) -> Response | None:
-    """Return a replay response on hit, ``None`` on miss / unused.
+def _cache_key(subject: str, key: str) -> str:
+    return f"idempotency:{subject}:{key}"
 
-    ``principal`` is optional so the same primitive works under tests
-    that don't gate auth. In production, the dependency tree always
-    resolves the principal first.
-    """
-    if not idempotency_key:
-        return None
+
+async def _lookup(request: Request, redis_key: str) -> dict[str, Any] | None:
     redis = getattr(request.app.state, "redis", None)
     if redis is None:
         return None
-
-    kid = principal.token_kid if principal else "anon"
-    cache_key = f"idempotency:{kid}:{idempotency_key}"
-    raw = await redis.client.get(cache_key)
+    raw = await redis.client.get(redis_key)
     if raw is None:
         return None
     try:
-        cached = orjson.loads(raw)
+        return orjson.loads(raw)
     except orjson.JSONDecodeError:
-        log.warning("idempotency.cache_corrupt", key=cache_key)
+        log.warning("idempotency.cache_corrupt", key=redis_key)
         return None
-    log.info(
-        "idempotency.replay",
-        key=cache_key,
-        status=cached.get("status"),
-    )
-    return Response(
-        status_code=int(cached.get("status", 200)),
-        headers={
-            _REPLAY_HEADER: "true",
-            "X-Body-Fingerprint": cached.get("body_fingerprint", ""),
-            "X-Correlation-ID": cached.get("correlation_id", ""),
-        },
-    )
 
 
 async def _persist(
     request: Request,
-    idempotency_key: str | None,
-    principal: Principal | None,
+    redis_key: str,
     response: Response,
 ) -> None:
-    if not idempotency_key:
-        return
     redis = getattr(request.app.state, "redis", None)
     if redis is None:
         return
     if not 200 <= response.status_code < 300:
         return  # only cache successful, replay-safe responses
-
-    kid = principal.token_kid if principal else "anon"
-    cache_key = f"idempotency:{kid}:{idempotency_key}"
     body = getattr(response, "body", b"") or b""
     payload = orjson.dumps(
         {
@@ -121,96 +98,86 @@ async def _persist(
             "correlation_id": getattr(request.state, "correlation_id", ""),
         }
     )
-    await redis.client.setex(cache_key, _IDEMPOTENCY_TTL_SECONDS, payload)
+    try:
+        await redis.client.setex(redis_key, _IDEMPOTENCY_TTL_SECONDS, payload)
+    except Exception:
+        log.exception("idempotency.persist_failed", key=redis_key)
 
 
-def idempotent(
+async def idempotent_replay_or_register(
     request: Request,
+    response: Response,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     principal: Annotated[Principal, Depends(get_current_principal)] = None,  # type: ignore[assignment]
 ) -> str | None:
-    """FastAPI dependency that registers idempotency intent for a route.
+    """FastAPI dependency that gates a route on idempotency.
 
-    The route handler runs normally; this dependency stashes the key on
-    ``request.state`` so the ``IdempotencyResponseMiddleware`` can pick
-    up the result and cache it. The dependency itself returns the key so
-    routes that already accept ``Idempotency-Key`` keep the same
-    signature.
+    Behaviour:
+
+    - Missing ``Idempotency-Key`` header → no-op, returns ``None``.
+    - Cache hit → raises ``HTTPException`` with the cached status code
+      and the ``X-Idempotent-Replay`` header set. The handler never
+      runs. (We use HTTPException rather than swapping the Response
+      because FastAPI dependencies cannot return a Response that
+      replaces the handler's; raising is the supported short-circuit.)
+    - Cache miss → registers a ``BackgroundTasks``-like hook on
+      ``request.state`` so the response is persisted after the handler
+      finishes successfully. Returns the key so the handler can read
+      it if it wants to use the same key for downstream calls.
+
+    The persistence step lives in
+    :func:`persist_idempotent_response` which routes call as a second
+    dependency wired through the response-cycle. Splitting the two
+    halves keeps each half single-responsibility.
     """
-    request.state.idempotency_key = idempotency_key
-    request.state.idempotency_kid = principal.token_kid if principal else "anon"
+    if not idempotency_key:
+        return None
+
+    subject = getattr(principal, "subject", None) or "anonymous"
+    redis_key = _cache_key(subject, idempotency_key)
+    cached = await _lookup(request, redis_key)
+    if cached is not None:
+        log.info(
+            "idempotency.replay",
+            key=redis_key,
+            status=cached.get("status"),
+        )
+        # Short-circuit the handler. FastAPI will surface the
+        # HTTPException as a JSONResponse; we attach the replay marker
+        # via the ``headers`` dict.
+        raise HTTPException(
+            status_code=int(cached.get("status", 200)),
+            detail={
+                "replay": True,
+                "body_fingerprint": cached.get("body_fingerprint", ""),
+                "correlation_id": cached.get("correlation_id", ""),
+            },
+            headers={
+                _REPLAY_HEADER: "true",
+                "X-Body-Fingerprint": cached.get("body_fingerprint", ""),
+            },
+        )
+
+    # Cache miss — stash the key on request.state so a downstream hook
+    # can persist the result after the handler runs. Routes that want
+    # idempotency persistence add ``Depends(persist_idempotent_response)``
+    # to their dependency list.
+    request.state.idempotency_redis_key = redis_key
     return idempotency_key
 
 
-class IdempotencyResponseMiddleware:
-    """ASGI middleware that completes the idempotency loop.
+async def persist_idempotent_response(
+    request: Request,
+    response: Response,
+) -> None:
+    """Persist the response under the redis key registered by
+    :func:`idempotent_replay_or_register`.
 
-    Runs BEFORE the route to short-circuit on cache hit, then AFTER the
-    route to persist the response fingerprint. Uses pure ASGI rather
-    than ``BaseHTTPMiddleware`` because we need to swap responses without
-    buffering the entire body twice through the BaseHTTPMiddleware shim.
+    Use as a second dependency on routes that want their successful
+    responses cached. Safe to add to every route — without a
+    registered key it's a no-op.
     """
-
-    def __init__(self, app) -> None:  # type: ignore[no-untyped-def]
-        self.app = app
-
-    async def __call__(self, scope, receive, send) -> None:  # type: ignore[no-untyped-def]
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        request = Request(scope, receive=receive)
-        idempotency_key = request.headers.get("idempotency-key")
-        # On cache hit we short-circuit BEFORE running the route. Auth has
-        # not yet happened at this layer — we use ``anon`` as the kid
-        # bucket, which means the HTTP-level cache always treats hits as
-        # the same caller. That's safe because the body fingerprint is
-        # also checked at the application layer for high-stakes routes.
-        replay = await _enforce(request, idempotency_key, principal=None)
-        if replay is not None:
-            await replay(scope, receive, send)
-            return
-
-        # Buffer the response so we can fingerprint the body before
-        # forwarding it. Only fingerprints are stored — never raw bodies.
-        captured_body = bytearray()
-        captured_status = 200
-        captured_headers: list[tuple[bytes, bytes]] = []
-
-        async def send_wrapper(message: Callable[..., Awaitable[None]] | dict) -> None:  # type: ignore[type-arg]
-            nonlocal captured_status, captured_headers
-            if isinstance(message, dict):
-                if message.get("type") == "http.response.start":
-                    captured_status = message.get("status", 200)
-                    captured_headers = list(message.get("headers", []))
-                elif message.get("type") == "http.response.body":
-                    body = message.get("body", b"") or b""
-                    if body:
-                        captured_body.extend(body)
-            await send(message)
-
-        await self.app(scope, receive, send_wrapper)
-
-        if (
-            idempotency_key
-            and 200 <= captured_status < 300
-            and getattr(request.app.state, "redis", None) is not None
-        ):
-            redis = request.app.state.redis
-            kid = getattr(request.state, "idempotency_kid", "anon")
-            cache_key = f"idempotency:{kid}:{idempotency_key}"
-            payload = orjson.dumps(
-                {
-                    "status": captured_status,
-                    "body_fingerprint": sha256_hex(bytes(captured_body))
-                    if captured_body
-                    else "",
-                    "correlation_id": getattr(request.state, "correlation_id", ""),
-                }
-            )
-            try:
-                await redis.client.setex(
-                    cache_key, _IDEMPOTENCY_TTL_SECONDS, payload
-                )
-            except Exception:
-                log.exception("idempotency.persist_failed", key=cache_key)
+    redis_key = getattr(request.state, "idempotency_redis_key", None)
+    if not redis_key:
+        return
+    await _persist(request, redis_key, response)

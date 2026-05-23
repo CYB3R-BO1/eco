@@ -13,8 +13,14 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Phase 7 WP1 — known dev sentinel for the default JWT signing secret.
+# Used by the production guardrail to refuse to boot if a deployment
+# forgot to set SECURITY_JWT_KEYS. Centralized so a future rename in
+# SecuritySettings.jwt_keys default stays in sync.
+_DEV_JWT_SECRET_SENTINEL = "change-me-dev-only"
 
 Environment = Literal["development", "testing", "production"]
 
@@ -281,7 +287,7 @@ class SecuritySettings(BaseSettings):
     )
 
     jwt_keys: list[JWTKey] = Field(
-        default_factory=lambda: [JWTKey(kid="dev", secret=SecretStr("change-me-dev-only"))]
+        default_factory=lambda: [JWTKey(kid="dev", secret=SecretStr(_DEV_JWT_SECRET_SENTINEL))]
     )
     jwt_issuer: str = "ai-security-platform"
     jwt_audience: str = "ai-security-platform"
@@ -336,6 +342,11 @@ class RetentionSettings(BaseSettings):
     evidence_cron_minute: int = 30
     secure_deletion_interval_seconds: int = 60
 
+    # Phase 7 WP2 — idempotency_keys table TTL. The docstring on
+    # IdempotencyKeyRow promised "a scheduled job in a later phase will
+    # prune entries older than ~24h" — this is that knob.
+    idempotency_keys_hours: int = 24
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -360,6 +371,45 @@ class Settings(BaseSettings):
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
+
+    @model_validator(mode="after")
+    def _enforce_production_secret_guardrail(self) -> "Settings":
+        """Phase 7 WP1 — fail fast if a production deploy ships dev defaults.
+
+        Two failure modes get caught here:
+
+        1. ``SECURITY_JWT_KEYS`` env var unset in prod → the active signing
+           key is the literal ``change-me-dev-only`` string, and anyone
+           with read access to the source can forge tokens.
+        2. ``SECURITY_BOOTSTRAP_ADMIN_SECRET`` left empty → the admin
+           surface (token issuance + key rotation) is intentionally locked
+           in prod (the routers refuse the call), but flagging it here
+           gives an operator a clear startup error rather than a 403 the
+           first time they try to mint a token.
+
+        Both checks only fire when ``environment == "production"``.
+        Development / testing environments keep the friendly defaults.
+        """
+        if self.environment != "production":
+            return self
+        active_secret = (
+            self.security.jwt_keys[0].secret.get_secret_value()
+            if self.security.jwt_keys
+            else ""
+        )
+        if not active_secret or active_secret == _DEV_JWT_SECRET_SENTINEL:
+            raise ValueError(
+                "production deploy is using the dev-default JWT signing key. "
+                "Set SECURITY_JWT_KEYS to a JSON array of {kid, secret} "
+                "objects from your secret manager before booting."
+            )
+        if not self.security.bootstrap_admin_secret.get_secret_value():
+            raise ValueError(
+                "production deploy has empty SECURITY_BOOTSTRAP_ADMIN_SECRET. "
+                "Set it to a long random string so /tokens/issue can be "
+                "authenticated by the operator who is bootstrapping the system."
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

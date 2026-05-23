@@ -78,6 +78,13 @@ class ReasoningAgent(BaseAgent):
         self._max_completion_tokens = max_completion_tokens
 
     async def _run(self, ctx: AgentExecutionContext) -> AgentResult:
+        """Orchestrate the reasoning agent's three phases.
+
+        Phase 7 WP5 split the original 160-line implementation into
+        three focused coroutines — ``_check_firewall``,
+        ``_call_llm_with_budget``, and ``_persist_completion`` — so the
+        control flow reads top-to-bottom in this method.
+        """
         if ctx.investigation_id is None:
             return AgentResult(
                 agent_run_id=ctx.agent_run_id,
@@ -88,49 +95,93 @@ class ReasoningAgent(BaseAgent):
 
         started = time.monotonic()
         template = PROMPT_TEMPLATES[_DEFAULT_TEMPLATE_ID]
-        findings = list(ctx.inputs.get("findings") or [])
+        rendered = await self._render(ctx, template)
 
-        # Pull a few memory entries so the summary has running context.
+        if self._prompt_safety_enabled:
+            blocked_result = await self._check_firewall(ctx, rendered, started)
+            if blocked_result is not None:
+                return blocked_result
+
+        completion_or_failure = await self._call_llm_with_budget(
+            ctx, template, rendered, started
+        )
+        if isinstance(completion_or_failure, AgentResult):
+            return completion_or_failure
+        completion = completion_or_failure
+
+        return await self._persist_completion(
+            ctx, template, rendered, completion, started
+        )
+
+    async def _render(
+        self,
+        ctx: AgentExecutionContext,
+        template: ReasoningPrompt,
+    ) -> str:
+        """Pull memory + findings and render the prompt template."""
+        findings = list(ctx.inputs.get("findings") or [])
         memory_entries: list[MemoryEntry] = []
         if ctx.memory is not None:
             try:
                 memory_entries = await ctx.memory.list()
             except Exception:
                 log.exception("agent.reasoning.memory_list_failed")
-
-        rendered = self._render_prompt(
+        return self._render_prompt(
             template,
             investigation_id=ctx.investigation_id,
             findings=findings,
             memory_entries=memory_entries,
         )
 
-        # --- Prompt-safety dogfooding (Phase 4) ----------------------
-        if self._prompt_safety_enabled:
-            blocked = await self._firewall_blocks(rendered)
-            if blocked is not None:
-                async with ctx.database.session() as session:
-                    await ctx.event_emitter.emit(
-                        session,
-                        EventType.REASONING_BLOCKED_BY_FIREWALL,
-                        source=f"agent:{self.name}",
-                        investigation_id=ctx.investigation_id,
-                        target=str(ctx.agent_run_id),
-                        metadata={"firewall_action": blocked},
-                        actor=f"agent:{self.name}",
-                        confidence=0.0,
-                    )
-                    await session.commit()
-                return AgentResult(
-                    agent_run_id=ctx.agent_run_id,
-                    agent_name=self.name,
-                    status=AgentRunStatus.AI_UNAVAILABLE,
-                    error=f"rendered prompt blocked by firewall: {blocked}",
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                    metadata={"firewall_action": blocked},
-                )
+    async def _check_firewall(
+        self,
+        ctx: AgentExecutionContext,
+        rendered: str,
+        started: float,
+    ) -> AgentResult | None:
+        """Run the firewall over the rendered prompt; emit + bail on block.
 
-        # --- Token budget reservation --------------------------------
+        Returns ``None`` when the prompt passes (caller continues); an
+        ``AgentResult`` with status ``AI_UNAVAILABLE`` when the firewall
+        flagged BLOCK or REQUIRE_REVIEW.
+        """
+        blocked = await self._firewall_blocks(rendered)
+        if blocked is None:
+            return None
+        async with ctx.database.session() as session:
+            await ctx.event_emitter.emit(
+                session,
+                EventType.REASONING_BLOCKED_BY_FIREWALL,
+                source=f"agent:{self.name}",
+                investigation_id=ctx.investigation_id,
+                target=str(ctx.agent_run_id),
+                metadata={"firewall_action": blocked},
+                actor=f"agent:{self.name}",
+                confidence=0.0,
+            )
+            await session.commit()
+        return AgentResult(
+            agent_run_id=ctx.agent_run_id,
+            agent_name=self.name,
+            status=AgentRunStatus.AI_UNAVAILABLE,
+            error=f"rendered prompt blocked by firewall: {blocked}",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            metadata={"firewall_action": blocked},
+        )
+
+    async def _call_llm_with_budget(
+        self,
+        ctx: AgentExecutionContext,
+        template: ReasoningPrompt,
+        rendered: str,
+        started: float,
+    ) -> Any:
+        """Reserve tokens, call the LLM, commit/release on result.
+
+        Returns the completion object on success, an ``AgentResult``
+        with ``AI_UNAVAILABLE`` on any failure (budget exceeded,
+        provider error, unknown exception).
+        """
         estimated_in = estimate_tokens(template.system) + estimate_tokens(rendered)
         reservation = estimated_in + self._max_completion_tokens
         if ctx.token_budget is not None:
@@ -140,10 +191,12 @@ class ReasoningAgent(BaseAgent):
                 return await self._emit_ai_unavailable(
                     ctx,
                     started,
-                    reason=f"token budget exceeded: requested={exc.requested} remaining={exc.remaining}",
+                    reason=(
+                        f"token budget exceeded: "
+                        f"requested={exc.requested} remaining={exc.remaining}"
+                    ),
                 )
 
-        # --- LLM call ------------------------------------------------
         try:
             completion = await self._llm.complete(
                 prompt_template_id=template.template_id,
@@ -166,17 +219,28 @@ class ReasoningAgent(BaseAgent):
                 ctx, started, reason=f"{type(exc).__name__}: {exc}"
             )
 
-        # --- Token budget reconciliation -----------------------------
-        actual = completion.usage.total
+        # Reconcile reservation with actual usage. The reservation was an
+        # upper bound; commit the truthy usage so the budget tracks reality.
         if ctx.token_budget is not None:
             try:
                 await ctx.token_budget.commit(
-                    ctx.investigation_id, reserved=reservation, actual=actual
+                    ctx.investigation_id,
+                    reserved=reservation,
+                    actual=completion.usage.total,
                 )
             except Exception:
                 log.exception("agent.reasoning.budget_commit_failed")
+        return completion
 
-        # --- Persist completion as AI_GENERATED evidence -------------
+    async def _persist_completion(
+        self,
+        ctx: AgentExecutionContext,
+        template: ReasoningPrompt,
+        rendered: str,
+        completion: Any,
+        started: float,
+    ) -> AgentResult:
+        """Write the AI_GENERATED Evidence row + memory entry + summary."""
         evidence_refs: list[uuid.UUID] = []
         async with ctx.database.session() as session:
             ev = Evidence(

@@ -60,10 +60,46 @@ class OrchestrationService:
         self._db = database
         self._events = event_emitter
         self._graphs = graphs
+        # Phase 7 WP1 — background workflow tasks tracked so the lifespan
+        # can drain them on shutdown. ``add_done_callback(_discard)`` removes
+        # the task once it completes (success or exception), so the set
+        # mirrors only in-flight work. Bare ``asyncio.create_task`` would
+        # let the task be GC'd mid-flight ("Task was destroyed but it is
+        # pending") and would not be cancellable on shutdown.
+        self._tasks: set[asyncio.Task[None]] = set()
 
     @property
     def supported_workflows(self) -> list[str]:
         return sorted(self._graphs.keys())
+
+    @property
+    def in_flight_count(self) -> int:
+        """Number of background workflow tasks still running."""
+        return len(self._tasks)
+
+    async def drain(self, *, timeout: float = 30.0) -> None:
+        """Wait for in-flight workflow tasks to finish or cancel them.
+
+        Called from the FastAPI lifespan shutdown hook. Uses
+        ``asyncio.wait`` so we get a bounded shutdown — a runaway workflow
+        cannot delay process exit indefinitely. Remaining tasks are
+        cancelled after the timeout.
+        """
+        if not self._tasks:
+            return
+        pending = set(self._tasks)
+        done, still_pending = await asyncio.wait(
+            pending, timeout=timeout, return_when=asyncio.ALL_COMPLETED
+        )
+        if still_pending:
+            log.warning(
+                "orchestration.drain.timeout",
+                cancelled=len(still_pending),
+                completed=len(done),
+                timeout_s=timeout,
+            )
+            for task in still_pending:
+                task.cancel()
 
     async def run_workflow(
         self,
@@ -142,17 +178,23 @@ class OrchestrationService:
             await session.commit()
 
         if background:
-            # Fire-and-forget; the API returns 202 and the caller polls
-            # /agents/status. Exceptions are logged inside _execute.
-            asyncio.create_task(
+            # Fire-and-forget BUT tracked. The API returns 202 and the
+            # caller polls /agents/status. Exceptions are logged inside
+            # _execute. The task is registered in self._tasks so the
+            # lifespan drain can wait on it during shutdown — see
+            # ``drain()``.
+            task = asyncio.create_task(
                 self._execute(
                     workflow_run_id=workflow_run_id,
                     workflow_name=workflow_name,
                     inputs=inputs,
                     options=options or {},
                     correlation_id=correlation_id,
-                )
+                ),
+                name=f"orchestration.workflow.{workflow_run_id}",
             )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
         else:
             await self._execute(
                 workflow_run_id=workflow_run_id,

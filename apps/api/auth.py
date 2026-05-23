@@ -13,7 +13,7 @@ metrics server stay outside this dependency, per WP3 requirement.
 """
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, cast
 
 import structlog
 from fastapi import Depends, HTTPException, Request, status
@@ -38,10 +38,17 @@ def _record_denial(reason: str, *, kid: str | None = None) -> None:
 
 
 def _settings_from_request(request: Request) -> Settings:
-    settings = getattr(request.app.state, "settings", None)
-    if settings is None:
-        settings = get_settings()
-    return settings  # type: ignore[no-any-return]
+    """Resolve the active :class:`Settings`.
+
+    Tests construct the app with custom settings parked on
+    ``request.app.state.settings``; production hits ``get_settings()``.
+    Phase 7 WP5 dropped the ``# type: ignore`` by narrowing via
+    ``isinstance`` + ``cast``.
+    """
+    candidate = getattr(request.app.state, "settings", None)
+    if isinstance(candidate, Settings):
+        return candidate
+    return cast(Settings, get_settings())
 
 
 async def get_current_principal(

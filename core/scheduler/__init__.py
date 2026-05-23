@@ -26,13 +26,31 @@ def build_scheduler() -> Any | None:
     Returning ``None`` keeps the no-op path explicit at the call site so
     tests without the dependency installed still pass — production
     deployments install ``apscheduler`` and get the real scheduler.
+
+    Phase 7 WP3: a missing ``apscheduler`` in production means retention
+    jobs never run — a silent data-growth regression. We escalate from
+    INFO to WARNING and bump the synthetic
+    ``retention_job_runs_total{job="scheduler_disabled",outcome="error"}``
+    counter once so an operator alert fires on first boot.
     """
     try:
         from apscheduler.schedulers.asyncio import (  # type: ignore[import-not-found]
             AsyncIOScheduler,
         )
     except ImportError:
-        log.info("scheduler.disabled.apscheduler_unavailable")
+        log.warning(
+            "scheduler.disabled.apscheduler_unavailable",
+            impact="retention jobs will NOT run",
+            fix="add `apscheduler>=3.10` to runtime deps",
+        )
+        try:
+            from core.observability.metrics import RETENTION_JOB_RUNS_TOTAL
+
+            RETENTION_JOB_RUNS_TOTAL.labels(
+                job="scheduler_disabled", outcome="error"
+            ).inc()
+        except Exception:  # noqa: BLE001 — metric infra optional too
+            pass
         return None
     return AsyncIOScheduler()
 

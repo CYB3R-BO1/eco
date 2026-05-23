@@ -15,6 +15,7 @@ from core.scheduler.jobs import (
     retention_dlq,
     retention_events,
     retention_evidence,
+    retention_idempotency,
 )
 
 
@@ -27,7 +28,12 @@ async def main() -> int:
     await db.connect()
     try:
         results = []
-        for job in (retention_evidence, retention_events, retention_dlq):
+        for job in (
+            retention_evidence,
+            retention_events,
+            retention_dlq,
+            retention_idempotency,
+        ):
             result = await job.run(db, retention)
             results.append(result)
             print(
